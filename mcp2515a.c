@@ -261,7 +261,9 @@ static int mcp2515a_config(struct net_device *net)
         ret = spi_write(spi, buffer, 6);
         if (ret)
                 return ret;
-
+	/* keep CNF3 - it gets overwritten by the below...*/
+	buffer[5]=buffer[2];
+	
 	/* enter requested mode */
 	buffer[1]=MCP2515_REG_CANCTRL;
 	/* select the mode we want */
@@ -285,7 +287,7 @@ static int mcp2515a_config(struct net_device *net)
 	
 	/* dump the CNF */
 	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
-		buffer[2],buffer[3],buffer[4],buffer[5]);
+		buffer[2],buffer[4],buffer[3],buffer[5]);
 
 	/* and return */
 	return 0;
@@ -293,7 +295,10 @@ static int mcp2515a_config(struct net_device *net)
 
 static int mcp2515a_do_set_mode(struct net_device *net, enum can_mode mode)
 {
-	return mcp2515a_config(net);
+	if (mode==CAN_MODE_START)
+		return mcp2515a_config(net);
+	/* otherwise send message that it is not supported... */
+	return -EOPNOTSUPP;
 }
 
 /* the interrupt-handler for this device */
@@ -301,6 +306,7 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 {
         //struct net_device *net = dev_id;
         //struct mcp2515a_priv *priv = netdev_priv(net);
+	printk(KERN_DEBUG "Interrupt handled\n");
 	/* we will just schedule a transfer */
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
