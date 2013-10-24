@@ -58,6 +58,21 @@
 #define MCP2515_REG_CANSTAT       0x0E
 #define MCP2515_REG_CANCTRL       0x0F
 
+#define MCP2515_REG_CANCTRL_REQOP_NORMAL   (0<<5)
+#define MCP2515_REG_CANCTRL_REQOP_SLEEP    (1<<5)
+#define MCP2515_REG_CANCTRL_REQOP_LOOPBACK (2<<5)
+#define MCP2515_REG_CANCTRL_REQOP_LISTEN   (3<<5)
+#define MCP2515_REG_CANCTRL_REQOP_CONFIG   (4<<5)
+
+#define MCP2515_REG_CANCTRL_ABORT          (1<<4)
+#define MCP2515_REG_CANCTRL_OSM            (1<<3)
+
+#define MCP2515_REG_CANCTRL_CLKEN          (1<<2)
+#define MCP2515_REG_CANCTRL_CLKPRE_1       (0)
+#define MCP2515_REG_CANCTRL_CLKPRE_2       (1)
+#define MCP2515_REG_CANCTRL_CLKPRE_4       (2)
+#define MCP2515_REG_CANCTRL_CLKPRE_8       (3)
+  
 #define MCP2515_REG_CNF3          0x28
 #define MCP2515_REG_CNF2          0x29
 #define MCP2515_REG_CNF1          0x2A
@@ -67,6 +82,13 @@
 
 #define MCP2515_REG_RXB0CTRL      0x60
 #define MCP2515_REG_RXB1CTRL      0x70
+
+#define MCP2515_REG_RXB_RXM_ANY   (3<<6)
+#define MCP2515_REG_RXB_RXM_EXT   (2<<6)
+#define MCP2515_REG_RXB_RXM_STD   (1<<6)
+#define MCP2515_REG_RXB_RXM_FILTER (0<<6)
+
+#define MCP2515_REG_RXB_BUKT      (1<<2)
 
 struct mcp2515a_transfers;
 
@@ -79,6 +101,19 @@ struct mcp2515a_priv {
 	/* the DMA Buffer */
 	dma_addr_t transfers_dma_addr;
 	struct mcp2515a_transfers *transfers;
+};
+
+
+static const struct can_bittiming_const mcp2515a_bittiming_const = {
+        .name = "mcp2515",
+        .tseg1_min = 2,
+        .tseg1_max = 16,
+        .tseg2_min = 2,
+        .tseg2_max = 8,
+        .sjw_max = 4,
+        .brp_min = 1,
+        .brp_max = 64,
+        .brp_inc = 1,
 };
 
 static int mcp2515a_reset(struct spi_device *spi)
@@ -173,7 +208,92 @@ static int mcp2515a_init_transfers(struct net_device* net)
 
 static int mcp2515a_config(struct net_device *net)
 {
+        struct mcp2515a_priv *priv = netdev_priv(net);
+        struct spi_device *spi = priv->spi;
+        struct can_bittiming *bt = &priv->can.bittiming;
+	u8 buffer[6];
+	int ret=0;
+
+	/* fill in buffer with values */
+	buffer[0]=MCP2515_CMD_WRITE;
+
+	/* enter "CONFIG" mode */
+	buffer[1]=MCP2515_REG_CANCTRL;
+	buffer[2]=MCP2515_REG_CANCTRL_REQOP_CONFIG;
+
+	/* configure RXB0 */
+	buffer[1]=MCP2515_REG_RXB0CTRL;
+	buffer[2]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
+		| MCP2515_REG_RXB_BUKT /* rollover */
+		; 
+	/* and configure it */
+        ret = spi_write(spi, buffer, 3);
+        if (ret)
+                return ret;
+
+	/* now configure RXB1 */
+	buffer[1]=MCP2515_REG_RXB1CTRL;
+	buffer[2]=MCP2515_REG_RXB_RXM_ANY /*receive any message */
+		;
+	/* and configure it */
+        ret = spi_write(spi, buffer, 3);
+        if (ret)
+                return ret;
+
+	/* configure CNF */
+	buffer[1]=MCP2515_REG_CNF3;
+	/* CNF3 */
+	buffer[2]=bt->phase_seg2 - 1;
+	/* CNF2 */
+	buffer[3]=
+		(priv->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES ? 0xc0 : 0x80)
+		| (bt->phase_seg1 - 1) << 3 
+		| (bt->prop_seg - 1)
+		;
+	/* CNF1 */
+	buffer[4] = 
+		(bt->sjw - 1) << 6 
+		| (bt->brp - 1);
+	/* CANINTE */
+	buffer[5] = 0xff; /* All interrupts */
+	
+	/* and configure it */
+        ret = spi_write(spi, buffer, 6);
+        if (ret)
+                return ret;
+
+	/* enter requested mode */
+	buffer[1]=MCP2515_REG_CANCTRL;
+	/* select the mode we want */
+        if (priv->can.ctrlmode & CAN_CTRLMODE_LOOPBACK) {
+		buffer[2]=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
+        } else if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
+		buffer[2]=MCP2515_REG_CANCTRL_REQOP_LISTEN;
+        } else {
+		buffer[2]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
+	}
+	/* set one-shot mode if needed */
+	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
+		buffer[2]|=MCP2515_REG_CANCTRL_OSM;
+
+	/* and configure it */
+        ret = spi_write(spi, buffer, 3);
+        if (ret)
+                return ret;
+
+	/* maybe we should check here that it worked as expected... */
+	
+	/* dump the CNF */
+	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
+		buffer[2],buffer[3],buffer[4],buffer[5]);
+
+	/* and return */
 	return 0;
+}
+
+static int mcp2515a_do_set_mode(struct net_device *net, enum can_mode mode)
+{
+	return mcp2515a_config(net);
 }
 
 /* the interrupt-handler for this device */
@@ -292,16 +412,24 @@ static int mcp2515a_probe(struct spi_device *spi)
 
 	/* setting up as netdev */
 	SET_NETDEV_DEV(net, &spi->dev);
-
-	/* get the private data */
-	priv = netdev_priv(net);
-
 	/*  link in the device ops */
 	net->netdev_ops = &mcp2515a_netdev_ops;
-	/* also set flags, but why? */
 	net->flags |= IFF_ECHO;
-	/* assign spi */
+
+	/* get the private data and fill in details */
+	priv = netdev_priv(net);
+
+	/* fill in private data */
 	priv->spi = spi;
+	priv->net = net;
+        priv->can.clock.freq = pdata->oscillator_frequency / 2;
+	priv->can.bittiming_const = & mcp2515a_bittiming_const;
+        priv->can.ctrlmode_supported = 
+		CAN_CTRLMODE_3_SAMPLES
+                | CAN_CTRLMODE_LOOPBACK 
+		| CAN_CTRLMODE_LISTENONLY
+		| CAN_CTRLMODE_ONE_SHOT ;
+        priv->can.do_set_mode = mcp2515a_do_set_mode;
 
 	/* allocate some buffers from DMA space */
 	ret=mcp2515a_init_transfers(net);
