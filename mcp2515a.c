@@ -103,6 +103,26 @@
 #define MCP2515_REG_TXB_TXP_2     (2)
 #define MCP2515_REG_TXB_TXP_3     (3)
 
+#define MCP2515_REG_BFPCTRL       0x0c
+#define MCP2515_REG_BFP_B1BFS     (1<<5) /* pin RX1 value */
+#define MCP2515_REG_BFP_B0BFS     (1<<4) /* pin RX0 value */
+#define MCP2515_REG_BFP_B1BFE     (1<<3) /* pin RX1 enabled */
+#define MCP2515_REG_BFP_B0BFE     (1<<2) /* pin RX0 enabled */
+#define MCP2515_REG_BFP_B1BFM     (1<<1) /* pin RX1 as interrupt on buffer full */
+#define MCP2515_REG_BFP_B0BFM     (1<<0) /* pin RX0 as interrupt on buffer full */
+
+#define MCP2515_REG_TXRTSCTRL     0x0d
+#define MCP2515_REG_TXRTS_B2RTS   (1<<5) /* pin TX2 value */
+#define MCP2515_REG_TXRTS_B1RTS   (1<<4) /* pin TX1 value */
+#define MCP2515_REG_TXRTS_B0RTS   (1<<3) /* pin TX0 value */
+#define MCP2515_REG_TXRTS_B2RTSM  (1<<2) /* pin TX2 as interrupt to send message */
+#define MCP2515_REG_TXRTS_B1RTSM  (1<<1) /* pin TX1 as interrupt to send message */
+#define MCP2515_REG_TXRTS_B0RTSM  (1<<0) /* pin TX0 as interrupt to send message */
+
+#define MCP2515_REG_TEC           0x1c
+#define MCP2515_REG_REC           0x1d
+
+
 struct mcp2515a_transfers;
 
 /* the driver structure */
@@ -180,7 +200,10 @@ mcp2515a_confirm_device_err:
 		u8 data[datalen]; \
 		struct spi_transfer trans;\
 	} name;
-#define TRANSFER_INIT_WRITE(base,message,xfer,initialize,regist)	\
+#define TRANSFER_INIT(base,message) \
+	spi_message_init(&base->message.msg);				\
+	base->message.msg.is_dma_mapped=1;
+#define TRANSFER_INIT_WRITE(base,message,xfer,regist)			\
 	base->message.xfer.data;					\
 	base->message.xfer.cmd = MCP2515_CMD_WRITE;			\
 	base->message.xfer.reg = regist;				\
@@ -191,11 +214,26 @@ mcp2515a_confirm_device_err:
 		+offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
 	base->message.xfer.trans.rx_dma=0;				\
 	base->message.xfer.trans.cs_change=1;				\
-	if (initialize) {						\
-		spi_message_init(&base->message.msg);			\
-		base->message.msg.is_dma_mapped=1;			\
-	}								\
 	spi_message_add_tail(&base->message.xfer.trans,&base->message.msg);
+#define TRANSFER_INIT_READ(base,message,xfer,regist)			\
+	base->message.xfer##_rx.data;					\
+	base->message.xfer##_tx.cmd = MCP2515_CMD_READ;			\
+	base->message.xfer##_tx.reg = regist;				\
+	base->message.xfer##_tx.trans.len=2;				\
+	base->message.xfer##_tx.trans.tx_buf=&base->message.xfer##_tx.cmd; \
+	base->message.xfer##_tx.trans.rx_buf=NULL;			\
+	base->message.xfer##_tx.trans.tx_dma=base##_dma_addr		\
+		+offsetof(struct mcp2515a_transfers,message.xfer##_tx.cmd); \
+	base->message.xfer##_tx.trans.rx_dma=0;				\
+	spi_message_add_tail(&base->message.xfer##_tx.trans,&base->message.msg); \
+	base->message.xfer##_rx.trans.len=sizeof(base->message.xfer##_rx.data); \
+	base->message.xfer##_rx.trans.rx_buf=&base->message.xfer##_rx.data; \
+	base->message.xfer##_rx.trans.tx_buf=NULL;			\
+	base->message.xfer##_rx.trans.rx_dma=base##_dma_addr		\
+		+offsetof(struct mcp2515a_transfers,message.xfer##_rx.data); \
+	base->message.xfer##_rx.trans.rx_dma=0;				\
+	base->message.xfer##_rx.trans.cs_change=1;			\
+	spi_message_add_tail(&base->message.xfer##_rx.trans,&base->message.msg);
 
 struct mcp2515a_transfers {
 	/* the respective DMA buffers for RX/TX */
@@ -207,14 +245,18 @@ struct mcp2515a_transfers {
 	  /* the messages */
 	struct {
 		struct spi_message msg;
-		TRANSFER_STRUCT(changetoconfigmode,1);
 		TRANSFER_STRUCT(setRXB0ctrl,1);
 		TRANSFER_STRUCT(setRXB1ctrl,1);
 		TRANSFER_STRUCT(setTXB0ctrl,1);
 		TRANSFER_STRUCT(setTXB1ctrl,1);
 		TRANSFER_STRUCT(setTXB2ctrl,1);
-		TRANSFER_STRUCT(setCNF321INTE,4);
+		TRANSFER_STRUCT(seterrorcounter,2);
+		TRANSFER_STRUCT(changetoconfigmode,1);
+		TRANSFER_STRUCT(setpinctrl,2);
+		TRANSFER_STRUCT(setconfig,5);
 		TRANSFER_STRUCT(changetomode,1);
+		TRANSFER_STRUCT(readconfig_tx,0);
+		TRANSFER_STRUCT(readconfig_rx,8);
 	} config;
 };
 
@@ -243,29 +285,48 @@ static int mcp2515a_init_transfers(struct net_device* net)
 
 	/* now let us fill in the data structures */
 
-	/* move to config mode */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetoconfigmode,1,MCP2515_REG_CANCTRL);
-	data[0]=MCP2515_REG_CANCTRL_REQOP_CONFIG;
 	/* setting up receive policies for buffers */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB0ctrl       ,0,MCP2515_REG_RXB0CTRL);
+	TRANSFER_INIT(priv->transfers,config);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB0ctrl       ,MCP2515_REG_RXB0CTRL);
 	data[0]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
                 | MCP2515_REG_RXB_BUKT; /* rollover to RXB1*/
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB1ctrl       ,0,MCP2515_REG_RXB0CTRL);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB1ctrl       ,MCP2515_REG_RXB1CTRL);
 	data[0]=MCP2515_REG_RXB_RXM_ANY; /* receive any message */
-	/* setting up transmit policies for buffers */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB0ctrl       ,0,MCP2515_REG_TXB0CTRL);
+
+	/* setting up transmit policies for buffers - and resetting pending transmits */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB0ctrl       ,MCP2515_REG_TXB0CTRL);
 	data[0]=MCP2515_REG_TXB_TXP_0;
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB1ctrl       ,0,MCP2515_REG_TXB1CTRL);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB1ctrl       ,MCP2515_REG_TXB1CTRL);
 	data[0]=MCP2515_REG_TXB_TXP_1;
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB2ctrl       ,0,MCP2515_REG_TXB2CTRL);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB2ctrl       ,MCP2515_REG_TXB2CTRL);
 	data[0]=MCP2515_REG_TXB_TXP_2;
+
+	/* clear TEC/REC */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,seterrorcounter   ,MCP2515_REG_TEC);
+	data[0]=0; /* tec */
+	data[1]=0; /* rec */
+
+	/* move to config mode */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetoconfigmode,MCP2515_REG_CANCTRL);
+	data[0]=MCP2515_REG_CANCTRL_REQOP_CONFIG;
+
+	/* clear bit ctrl */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setpinctrl        ,MCP2515_REG_BFPCTRL);
+	data[0]=0; /* BFPCTRL - high impedance */
+	data[1]=0; /* TXRTSCTRL - no functionality*/
+
 	/* configure CNF and interrupt-registers */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setCNF321INTE     ,0,MCP2515_REG_RXB0CTRL);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setconfig     ,MCP2515_REG_CNF3);
 	data[0]=data[1]=data[2]=0; /* CNF3,CNF2,CNF1 */
 	data[3]=0xff; /* INTE - enable all interupt sources */
-	/* and move into the mode that has been really requested */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetomode      ,0,MCP2515_REG_CANCTRL);
-	data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
+	data[4]=0; /* INTF - clear all interupt sources */
+
+	/* and change to the final mode */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetomode     ,MCP2515_REG_CANCTRL);
+	data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL; /* the mode we want to enter */
+
+	/* initiate read of basic configs */
+	data=TRANSFER_INIT_READ(priv->transfers,config,readconfig     ,MCP2515_REG_CNF3);
 
 	/* and return ok */
 	return 0;
@@ -277,31 +338,33 @@ static int mcp2515a_config(struct net_device *net)
         struct spi_device *spi = priv->spi;
         struct can_bittiming *bt = &priv->can.bittiming;
 	int ret=0;
+	u8 mode=0;
 
 	/* select the mode we want */
 	if (priv->can.ctrlmode & CAN_CTRLMODE_LOOPBACK) {
-		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
+		mode=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
         } else if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
-		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_LISTEN;
+		mode=MCP2515_REG_CANCTRL_REQOP_LISTEN;
         } else {
-		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
+		mode=MCP2515_REG_CANCTRL_REQOP_NORMAL;
 	}
 	/* set one-shot mode if needed */
 	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
-		priv->transfers->config.changetomode.data[0]
-			|=MCP2515_REG_CANCTRL_OSM;
+		mode|=MCP2515_REG_CANCTRL_OSM;
+	priv->transfers->config.changetomode.data[0]=mode;
+
 	/* the Bit speed config */
 	/* CNF3 */
-	priv->transfers->config.setCNF321INTE.data[0]=
+	priv->transfers->config.setconfig.data[0]=
 		bt->phase_seg2 - 1;
 	/* CNF2 */
-	priv->transfers->config.setCNF321INTE.data[1]=
+	priv->transfers->config.setconfig.data[1]=
 		(priv->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES ? 0xc0 : 0x80)
 		| (bt->phase_seg1 - 1) << 3 
 		| (bt->prop_seg - 1)
 		;
 	/* CNF1 */
-	priv->transfers->config.setCNF321INTE.data[2]=
+	priv->transfers->config.setconfig.data[2]=
 		(bt->sjw - 1) << 6 
 		| (bt->brp - 1);
 
@@ -310,11 +373,11 @@ static int mcp2515a_config(struct net_device *net)
 	if (ret)
 		return ret;
 	/* dump the CNF */
-	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
-		priv->transfers->config.changetomode.data[0],
-		priv->transfers->config.setCNF321INTE.data[2],
-		priv->transfers->config.setCNF321INTE.data[1],
-		priv->transfers->config.setCNF321INTE.data[0]
+	netdev_info(net, "configured CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
+		priv->transfers->config.readconfig_rx.data[7],
+		priv->transfers->config.readconfig_rx.data[2],
+		priv->transfers->config.readconfig_rx.data[1],
+		priv->transfers->config.readconfig_rx.data[0]
 		);
 
 	/* and return */
