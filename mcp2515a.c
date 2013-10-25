@@ -278,7 +278,6 @@ static int mcp2515a_config(struct net_device *net)
         struct can_bittiming *bt = &priv->can.bittiming;
 	int ret=0;
 
-#if 1
 	/* select the mode we want */
 	if (priv->can.ctrlmode & CAN_CTRLMODE_LOOPBACK) {
 		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
@@ -317,90 +316,6 @@ static int mcp2515a_config(struct net_device *net)
 		priv->transfers->config.setCNF321INTE.data[1],
 		priv->transfers->config.setCNF321INTE.data[0]
 		);
-
-	/* and return */
-	return 0;
-
-	
-#else
-	u8 buffer[6];
-
-
-	/* fill in buffer with values */
-	buffer[0]=MCP2515_CMD_WRITE;
-
-	/* enter "CONFIG" mode */
-	buffer[1]=MCP2515_REG_CANCTRL;
-	buffer[2]=MCP2515_REG_CANCTRL_REQOP_CONFIG;
-
-	/* configure RXB0 */
-	buffer[1]=MCP2515_REG_RXB0CTRL;
-	buffer[2]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
-		| MCP2515_REG_RXB_BUKT /* rollover */
-		; 
-	/* and configure it */
-        ret = spi_write(spi, buffer, 3);
-        if (ret)
-                return ret;
-
-	/* now configure RXB1 */
-	buffer[1]=MCP2515_REG_RXB1CTRL;
-	buffer[2]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
-		;
-	/* and configure it */
-        ret = spi_write(spi, buffer, 3);
-        if (ret)
-                return ret;
-
-	/* configure CNF */
-	buffer[1]=MCP2515_REG_CNF3;
-	/* CNF3 */
-	buffer[2]=bt->phase_seg2 - 1;
-	/* CNF2 */
-	buffer[3]=
-		(priv->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES ? 0xc0 : 0x80)
-		| (bt->phase_seg1 - 1) << 3 
-		| (bt->prop_seg - 1)
-		;
-	/* CNF1 */
-	buffer[4] = 
-		(bt->sjw - 1) << 6 
-		| (bt->brp - 1);
-	/* CANINTE */
-	buffer[5] = 0xff; /* All interrupts */
-	
-	/* and configure it */
-        ret = spi_write(spi, buffer, 6);
-        if (ret)
-                return ret;
-	/* keep CNF3 - it gets overwritten by the below...*/
-	buffer[5]=buffer[2];
-	
-	/* enter requested mode */
-	buffer[1]=MCP2515_REG_CANCTRL;
-	/* select the mode we want */
-        if (priv->can.ctrlmode & CAN_CTRLMODE_LOOPBACK) {
-		buffer[2]=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
-        } else if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
-		buffer[2]=MCP2515_REG_CANCTRL_REQOP_LISTEN;
-        } else {
-		buffer[2]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
-	}
-	/* set one-shot mode if needed */
-	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
-		buffer[2]|=MCP2515_REG_CANCTRL_OSM;
-
-	/* and configure it */
-        ret = spi_write(spi, buffer, 3);
-        if (ret)
-                return ret;
-
-	/* maybe we should check here that it worked as expected... */
-	
-	/* dump the CNF */
-	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
-		buffer[2],buffer[4],buffer[3],buffer[5]);
-#endif
 
 	/* and return */
 	return 0;
