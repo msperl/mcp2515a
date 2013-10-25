@@ -90,6 +90,19 @@
 
 #define MCP2515_REG_RXB_BUKT      (1<<2)
 
+#define MCP2515_REG_TXB0CTRL      0x30
+#define MCP2515_REG_TXB1CTRL      0x40
+#define MCP2515_REG_TXB2CTRL      0x50
+
+#define MCP2515_REG_TXB_ABTF      (1<<6)
+#define MCP2515_REG_TXB_MLOA      (1<<5)
+#define MCP2515_REG_TXB_TXERR     (1<<4)
+#define MCP2515_REG_TXB_TXREQ     (1<<3)
+#define MCP2515_REG_TXB_TXP_0     (0)
+#define MCP2515_REG_TXB_TXP_1     (1)
+#define MCP2515_REG_TXB_TXP_2     (2)
+#define MCP2515_REG_TXB_TXP_3     (3)
+
 struct mcp2515a_transfers;
 
 /* the driver structure */
@@ -102,7 +115,6 @@ struct mcp2515a_priv {
 	dma_addr_t transfers_dma_addr;
 	struct mcp2515a_transfers *transfers;
 };
-
 
 static const struct can_bittiming_const mcp2515a_bittiming_const = {
         .name = "mcp2515",
@@ -161,22 +173,49 @@ mcp2515a_confirm_device_err:
 	return -ENODEV;
 }
 
+#define TRANSFER_STRUCT(name,datalen) \
+	struct { \
+		u8 cmd; \
+		u8 reg; \
+		u8 data[datalen]; \
+		struct spi_transfer trans;\
+	} name;
+#define TRANSFER_INIT_WRITE(base,message,xfer,initialize,regist)	\
+	base->message.xfer.data;					\
+	base->message.xfer.cmd = MCP2515_CMD_WRITE;			\
+	base->message.xfer.reg = regist;				\
+	base->message.xfer.trans.len=2+sizeof(base->message.xfer.data);	\
+	base->message.xfer.trans.tx_buf=&base->message.xfer.cmd;	\
+	base->message.xfer.trans.rx_buf=NULL;				\
+	base->message.xfer.trans.tx_dma=base##_dma_addr			\
+		+offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
+	base->message.xfer.trans.rx_dma=0;				\
+	base->message.xfer.trans.cs_change=1;				\
+	if (initialize) {						\
+		spi_message_init(&base->message.msg);			\
+		base->message.msg.is_dma_mapped=1;			\
+	}								\
+	spi_message_add_tail(&base->message.xfer.trans,&base->message.msg);
+
 struct mcp2515a_transfers {
-		/* the respective DMA buffers for RX/TX */
-		char rx0_buffer[13];
-		char rx1_buffer[13];
-		char tx0_buffer[13];
-		char tx1_buffer[13];
-		char tx2_buffer[13];
-		/* the messages */
-		struct {
-			struct spi_message msg;
-			struct spi_transfer transfers[2];
-		} initialize;
-		struct {
-			struct spi_message msg;
-			struct spi_transfer transfers[2];
-		} set_baud;
+	/* the respective DMA buffers for RX/TX */
+	char rx0_buffer[13];
+	char rx1_buffer[13];
+	char tx0_buffer[13];
+	char tx1_buffer[13];
+	char tx2_buffer[13];
+	  /* the messages */
+	struct {
+		struct spi_message msg;
+		TRANSFER_STRUCT(changetoconfigmode,1);
+		TRANSFER_STRUCT(setRXB0ctrl,1);
+		TRANSFER_STRUCT(setRXB1ctrl,1);
+		TRANSFER_STRUCT(setTXB0ctrl,1);
+		TRANSFER_STRUCT(setTXB1ctrl,1);
+		TRANSFER_STRUCT(setTXB2ctrl,1);
+		TRANSFER_STRUCT(setCNF321INTE,4);
+		TRANSFER_STRUCT(changetomode,1);
+	} config;
 };
 
 static void mcp2515a_free_transfers(struct net_device* net)
@@ -192,15 +231,41 @@ static void mcp2515a_free_transfers(struct net_device* net)
 static int mcp2515a_init_transfers(struct net_device* net)
 {
 	struct mcp2515a_priv *priv = netdev_priv(net);
+        struct device *dev = &priv->spi->dev;
+	u8* data;
 	/* first forece the coherent mask 
 	   - a bit of a hack, but at least it works... */
-        struct device *dev = &priv->spi->dev;
         dev->coherent_dma_mask = 0xffffffff;
 
 	/* allocate memory */
 	priv->transfers = dma_zalloc_coherent(&priv->spi->dev, sizeof(struct mcp2515a_transfers), &priv->transfers_dma_addr, GFP_KERNEL);
 	if (! priv->transfers) return -ENOMEM;
+
 	/* now let us fill in the data structures */
+
+	/* move to config mode */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetoconfigmode,1,MCP2515_REG_CANCTRL);
+	data[0]=MCP2515_REG_CANCTRL_REQOP_CONFIG;
+	/* setting up receive policies for buffers */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB0ctrl       ,0,MCP2515_REG_RXB0CTRL);
+	data[0]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
+                | MCP2515_REG_RXB_BUKT; /* rollover to RXB1*/
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB1ctrl       ,0,MCP2515_REG_RXB0CTRL);
+	data[0]=MCP2515_REG_RXB_RXM_ANY; /* receive any message */
+	/* setting up transmit policies for buffers */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB0ctrl       ,0,MCP2515_REG_TXB0CTRL);
+	data[0]=MCP2515_REG_TXB_TXP_0;
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB1ctrl       ,0,MCP2515_REG_TXB1CTRL);
+	data[0]=MCP2515_REG_TXB_TXP_1;
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setTXB2ctrl       ,0,MCP2515_REG_TXB2CTRL);
+	data[0]=MCP2515_REG_TXB_TXP_2;
+	/* configure CNF and interrupt-registers */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setCNF321INTE     ,0,MCP2515_REG_RXB0CTRL);
+	data[0]=data[1]=data[2]=0; /* CNF3,CNF2,CNF1 */
+	data[3]=0xff; /* INTE - enable all interupt sources */
+	/* and move into the mode that has been really requested */
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,changetomode      ,0,MCP2515_REG_CANCTRL);
+	data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
 
 	/* and return ok */
 	return 0;
@@ -211,8 +276,55 @@ static int mcp2515a_config(struct net_device *net)
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
         struct can_bittiming *bt = &priv->can.bittiming;
-	u8 buffer[6];
 	int ret=0;
+
+#if 1
+	/* select the mode we want */
+	if (priv->can.ctrlmode & CAN_CTRLMODE_LOOPBACK) {
+		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_LOOPBACK;
+        } else if (priv->can.ctrlmode & CAN_CTRLMODE_LISTENONLY) {
+		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_LISTEN;
+        } else {
+		priv->transfers->config.changetomode.data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL;
+	}
+	/* set one-shot mode if needed */
+	if (priv->can.ctrlmode & CAN_CTRLMODE_ONE_SHOT)
+		priv->transfers->config.changetomode.data[0]
+			|=MCP2515_REG_CANCTRL_OSM;
+	/* the Bit speed config */
+	/* CNF3 */
+	priv->transfers->config.setCNF321INTE.data[0]=
+		bt->phase_seg2 - 1;
+	/* CNF2 */
+	priv->transfers->config.setCNF321INTE.data[1]=
+		(priv->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES ? 0xc0 : 0x80)
+		| (bt->phase_seg1 - 1) << 3 
+		| (bt->prop_seg - 1)
+		;
+	/* CNF1 */
+	priv->transfers->config.setCNF321INTE.data[2]=
+		(bt->sjw - 1) << 6 
+		| (bt->brp - 1);
+
+	/* execute transfer */
+	ret=spi_sync(spi,&priv->transfers->config.msg);
+	if (ret)
+		return ret;
+	/* dump the CNF */
+	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
+		priv->transfers->config.changetomode.data[0],
+		priv->transfers->config.setCNF321INTE.data[2],
+		priv->transfers->config.setCNF321INTE.data[1],
+		priv->transfers->config.setCNF321INTE.data[0]
+		);
+
+	/* and return */
+	return 0;
+
+	
+#else
+	u8 buffer[6];
+
 
 	/* fill in buffer with values */
 	buffer[0]=MCP2515_CMD_WRITE;
@@ -233,7 +345,7 @@ static int mcp2515a_config(struct net_device *net)
 
 	/* now configure RXB1 */
 	buffer[1]=MCP2515_REG_RXB1CTRL;
-	buffer[2]=MCP2515_REG_RXB_RXM_ANY /*receive any message */
+	buffer[2]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
 		;
 	/* and configure it */
         ret = spi_write(spi, buffer, 3);
@@ -288,6 +400,7 @@ static int mcp2515a_config(struct net_device *net)
 	/* dump the CNF */
 	netdev_info(net, "Configured device as CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
 		buffer[2],buffer[4],buffer[3],buffer[5]);
+#endif
 
 	/* and return */
 	return 0;
@@ -308,6 +421,8 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         //struct mcp2515a_priv *priv = netdev_priv(net);
 	printk(KERN_DEBUG "Interrupt handled\n");
 	/* we will just schedule a transfer */
+	/* disable the interrupt - one of the handlers we reenable it*/
+	disable_irq_nosync(irq);
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
@@ -323,7 +438,9 @@ static int mcp2515a_open(struct net_device *net)
 {
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
+	struct mcp251x_platform_data *pdata = spi->dev.platform_data;
         int ret;
+	int flags=IRQF_ONESHOT;
 
 	/* just in case identify the device again */
         ret = mcp2515a_confirm_device(spi);
@@ -335,10 +452,16 @@ static int mcp2515a_open(struct net_device *net)
         if (ret)
                 return ret;
 
-	/* request the IRQ */
+	/* the interrupt flag calculation */
+	if (pdata->irq_flags)
+		flags |= pdata->irq_flags;
+	else
+		flags |= IRQF_TRIGGER_FALLING;
+
+	/* request the IRQ with the above flags */
         ret = request_irq(spi->irq, 
 			mcp2515a_interrupt_handler,
-			IRQF_TRIGGER_FALLING,
+			flags,
 			net->name, 
 			net);
         if (ret)
@@ -352,7 +475,7 @@ static int mcp2515a_open(struct net_device *net)
         netif_wake_queue(net);
 
 	/* and log a message */
-	dev_info(&net->dev,"Started device with irq %i\n",spi->irq);
+	dev_info(&net->dev,"Started device with irq %i and irq flags=0x%x\n",spi->irq,flags);
 
 	/* and return */
         return 0;
