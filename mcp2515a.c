@@ -193,7 +193,7 @@ mcp2515a_confirm_device_err:
 	return -ENODEV;
 }
 
-#define TRANSFER_STRUCT(name,datalen) \
+#define TRANSFER_WRITE_STRUCT(name,datalen) \
 	struct { \
 		u8 cmd; \
 		u8 reg; \
@@ -215,25 +215,33 @@ mcp2515a_confirm_device_err:
 	base->message.xfer.trans.rx_dma=0;				\
 	base->message.xfer.trans.cs_change=1;				\
 	spi_message_add_tail(&base->message.xfer.trans,&base->message.msg);
+#define TRANSFER_READ_STRUCT(name,datalen) \
+	struct { \
+		u8 cmd; \
+		u8 reg; \
+		u8 data[datalen]; \
+		struct spi_transfer trans_tx;\
+		struct spi_transfer trans_rx;\
+	} name;
 #define TRANSFER_INIT_READ(base,message,xfer,regist)			\
-	base->message.xfer##_rx.data;					\
-	base->message.xfer##_tx.cmd = MCP2515_CMD_READ;			\
-	base->message.xfer##_tx.reg = regist;				\
-	base->message.xfer##_tx.trans.len=2;				\
-	base->message.xfer##_tx.trans.tx_buf=&base->message.xfer##_tx.cmd; \
-	base->message.xfer##_tx.trans.rx_buf=NULL;			\
-	base->message.xfer##_tx.trans.tx_dma=base##_dma_addr		\
-		+offsetof(struct mcp2515a_transfers,message.xfer##_tx.cmd); \
-	base->message.xfer##_tx.trans.rx_dma=0;				\
-	spi_message_add_tail(&base->message.xfer##_tx.trans,&base->message.msg); \
-	base->message.xfer##_rx.trans.len=sizeof(base->message.xfer##_rx.data); \
-	base->message.xfer##_rx.trans.rx_buf=&base->message.xfer##_rx.data; \
-	base->message.xfer##_rx.trans.tx_buf=NULL;			\
-	base->message.xfer##_rx.trans.rx_dma=base##_dma_addr		\
-		+offsetof(struct mcp2515a_transfers,message.xfer##_rx.data); \
-	base->message.xfer##_rx.trans.rx_dma=0;				\
-	base->message.xfer##_rx.trans.cs_change=1;			\
-	spi_message_add_tail(&base->message.xfer##_rx.trans,&base->message.msg);
+	base->message.xfer.data;					\
+	base->message.xfer.cmd = MCP2515_CMD_READ;			\
+	base->message.xfer.reg = regist;				\
+	base->message.xfer.trans_tx.len=2;				\
+	base->message.xfer.trans_tx.tx_buf=&base->message.xfer.cmd; \
+	base->message.xfer.trans_tx.rx_buf=NULL;			\
+	base->message.xfer.trans_tx.tx_dma=base##_dma_addr		\
+		+offsetof(struct mcp2515a_transfers,message.xfer.cmd); \
+	base->message.xfer.trans_rx.rx_dma=0;				\
+	spi_message_add_tail(&base->message.xfer.trans_tx,&base->message.msg); \
+	base->message.xfer.trans_rx.len=sizeof(base->message.xfer.data); \
+	base->message.xfer.trans_rx.rx_buf=&base->message.xfer.data; \
+	base->message.xfer.trans_rx.tx_buf=NULL;			\
+	base->message.xfer.trans_rx.rx_dma=base##_dma_addr		\
+		+offsetof(struct mcp2515a_transfers,message.xfer.data); \
+	base->message.xfer.trans_rx.rx_dma=0;				\
+	base->message.xfer.trans_rx.cs_change=1;			\
+	spi_message_add_tail(&base->message.xfer.trans_rx,&base->message.msg);
 
 struct mcp2515a_transfers {
 	/* the respective DMA buffers for RX/TX */
@@ -245,19 +253,36 @@ struct mcp2515a_transfers {
 	  /* the messages */
 	struct {
 		struct spi_message msg;
-		TRANSFER_STRUCT(setRXB0ctrl,1);
-		TRANSFER_STRUCT(setRXB1ctrl,1);
-		TRANSFER_STRUCT(setTXB0ctrl,1);
-		TRANSFER_STRUCT(setTXB1ctrl,1);
-		TRANSFER_STRUCT(setTXB2ctrl,1);
-		TRANSFER_STRUCT(seterrorcounter,2);
-		TRANSFER_STRUCT(changetoconfigmode,1);
-		TRANSFER_STRUCT(setpinctrl,2);
-		TRANSFER_STRUCT(setconfig,5);
-		TRANSFER_STRUCT(changetomode,1);
-		TRANSFER_STRUCT(readconfig_tx,0);
-		TRANSFER_STRUCT(readconfig_rx,8);
+		TRANSFER_WRITE_STRUCT(setRXB0ctrl,1);
+		TRANSFER_WRITE_STRUCT(setRXB1ctrl,1);
+		TRANSFER_WRITE_STRUCT(setTXB0ctrl,1);
+		TRANSFER_WRITE_STRUCT(setTXB1ctrl,1);
+		TRANSFER_WRITE_STRUCT(setTXB2ctrl,1);
+		TRANSFER_WRITE_STRUCT(seterrorcounter,2);
+		TRANSFER_WRITE_STRUCT(changetoconfigmode,1);
+		TRANSFER_WRITE_STRUCT(setpinctrl,2);
+		TRANSFER_WRITE_STRUCT(setconfig,5);
+		TRANSFER_WRITE_STRUCT(changetomode,1);
+		TRANSFER_READ_STRUCT(readconfig,8);
 	} config;
+	struct {
+		struct spi_message msg;
+		TRANSFER_READ_STRUCT(status,1);/* this actually wastes some memory, but it is minimal, if it really matters at all with structure alignments*/
+		TRANSFER_READ_STRUCT(rxstatus,1);
+	} read_status;
+	struct {
+		struct spi_message msg;
+		TRANSFER_READ_STRUCT(interr,3);
+		TRANSFER_READ_STRUCT(errcount,2);
+	} read_caninterr;
+	struct {
+		struct spi_message msg;
+		TRANSFER_READ_STRUCT(rx0,13);
+	} read_rx0;
+	struct {
+		struct spi_message msg;
+		TRANSFER_WRITE_STRUCT(rx0,2); /* this actually wastes some memory, but it is minimal, if it really matters at all with structure alignments*/
+	} clear_rx0;
 };
 
 static void mcp2515a_free_transfers(struct net_device* net)
@@ -326,7 +351,23 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	data[0]=MCP2515_REG_CANCTRL_REQOP_NORMAL; /* the mode we want to enter */
 
 	/* initiate read of basic configs */
-	data=TRANSFER_INIT_READ(priv->transfers,config,readconfig     ,MCP2515_REG_CNF3);
+	data=TRANSFER_INIT_READ(priv->transfers,config,readconfig        ,MCP2515_REG_CNF3);
+
+	/* The read status transfer */
+	TRANSFER_INIT(priv->transfers,read_status);
+	priv->transfers->read_status.msg.complete=NULL;
+	data=TRANSFER_INIT_READ(priv->transfers,read_status,status       ,MCP2515_REG_CANCTRL);
+	priv->transfers->read_status.status.cmd=MCP2515_CMD_STATUS;
+	priv->transfers->read_status.status.trans_tx.len=1;
+	data=TRANSFER_INIT_READ(priv->transfers,read_status,rxstatus     ,MCP2515_REG_CANCTRL);
+	priv->transfers->read_status.rxstatus.cmd=MCP2515_CMD_RXSTATUS;
+	priv->transfers->read_status.rxstatus.trans_tx.len=1;
+
+	/* the caninterr values */
+	TRANSFER_INIT(priv->transfers,read_caninterr);
+	/* possibly also set interrupts disabled here - where exactly? - there could be a race condition !*/
+	data=TRANSFER_INIT_READ(priv->transfers,read_caninterr,interr         ,MCP2515_REG_CANINTE);
+	data=TRANSFER_INIT_READ(priv->transfers,read_caninterr,errcount       ,MCP2515_REG_TEC);
 
 	/* and return ok */
 	return 0;
@@ -374,10 +415,10 @@ static int mcp2515a_config(struct net_device *net)
 		return ret;
 	/* dump the CNF */
 	netdev_info(net, "configured CTRL: 0x%02x CNF: 0x%02x 0x%02x 0x%02x\n",
-		priv->transfers->config.readconfig_rx.data[7],
-		priv->transfers->config.readconfig_rx.data[2],
-		priv->transfers->config.readconfig_rx.data[1],
-		priv->transfers->config.readconfig_rx.data[0]
+		priv->transfers->config.readconfig.data[7],
+		priv->transfers->config.readconfig.data[2],
+		priv->transfers->config.readconfig.data[1],
+		priv->transfers->config.readconfig.data[0]
 		);
 
 	/* and return */
