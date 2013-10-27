@@ -643,6 +643,7 @@ void mcp2515a_completed_read_status (void* context)
 		if (priv->carrier_off) {
 			dev_err(&net->dev,"CAN-Bus-error recovered\n");
 			netif_carrier_on(net);
+			priv->carrier_off=0;
 		}
 	}
 }
