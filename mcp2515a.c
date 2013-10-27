@@ -50,8 +50,8 @@
 #define MCP2515_CMD_STATUS        0xA0
 #define MCP2515_CMD_RXSTATUS      0xB0
 #define MCP2515_CMD_RESET         0xC0
-#define MCP2515_CMD_READ_RX(i)    (0x50+i<<2)
-#define MCP2515_CMD_WRITE_TX(i)   (0x40+i<<1)
+#define MCP2515_CMD_READ_RX(i)    (0x90+(i<<2))
+#define MCP2515_CMD_WRITE_TX(i)   (0x40+(i<<1))
 #define MCP2515_CMD_REQ2SEND(i)   (0x80+i)
 
 /* the MCP register */
@@ -76,18 +76,37 @@
 #define MCP2515_REG_CNF3          0x28
 #define MCP2515_REG_CNF2          0x29
 #define MCP2515_REG_CNF1          0x2A
+
 #define MCP2515_REG_CANINTE       0x2B
 #define MCP2515_REG_CANINTF       0x2C
+#define MCP2515_REG_CANINT_MERR           (1<<7)
+#define MCP2515_REG_CANINT_WAKI           (1<<6)
+#define MCP2515_REG_CANINT_ERRI           (1<<5)
+#define MCP2515_REG_CANINT_TX2I           (1<<4)
+#define MCP2515_REG_CANINT_TX1I           (1<<3)
+#define MCP2515_REG_CANINT_TX0I           (1<<2)
+#define MCP2515_REG_CANINT_RX1I           (1<<1)
+#define MCP2515_REG_CANINT_RX0I           (1<<0)
+
 #define MCP2515_REG_EFLG          0x2D
+#define MCP2515_REG_EFLG_RX1OVR            (1<<7)
+#define MCP2515_REG_EFLG_RX0OVR            (1<<6)
+#define MCP2515_REG_EFLG_TXBO              (1<<5)
+#define MCP2515_REG_EFLG_TXEP              (1<<4)
+#define MCP2515_REG_EFLG_RXEP              (1<<3)
+#define MCP2515_REG_EFLG_TXWAR             (1<<2)
+#define MCP2515_REG_EFLG_RXWAR             (1<<1)
+#define MCP2515_REG_EFLG_EWARN             (1<<0)
 
 #define MCP2515_REG_RXB0CTRL      0x60
 #define MCP2515_REG_RXB1CTRL      0x70
 
-#define MCP2515_REG_RXB_RXM_ANY   (3<<6)
-#define MCP2515_REG_RXB_RXM_EXT   (2<<6)
-#define MCP2515_REG_RXB_RXM_STD   (1<<6)
-#define MCP2515_REG_RXB_RXM_FILTER (0<<6)
+#define MCP2515_REG_RXB_RXM_ANY   (3<<5)
+#define MCP2515_REG_RXB_RXM_EXT   (2<<5)
+#define MCP2515_REG_RXB_RXM_STD   (1<<5)
+#define MCP2515_REG_RXB_RXM_FILTER (0<<5)
 
+#define MCP2515_REG_RXB_RXRTR     (1<<2)
 #define MCP2515_REG_RXB_BUKT      (1<<2)
 
 #define MCP2515_REG_TXB0CTRL      0x30
@@ -122,6 +141,15 @@
 #define MCP2515_REG_TEC           0x1c
 #define MCP2515_REG_REC           0x1d
 
+#define MCP2515_CMD_STATUS_RX0IF   (1<<0)
+#define MCP2515_CMD_STATUS_RX1IF   (1<<1)
+#define MCP2515_CMD_STATUS_TX0REQ  (1<<2)
+#define MCP2515_CMD_STATUS_TX0IF   (1<<3)
+#define MCP2515_CMD_STATUS_TX1REQ  (1<<4)
+#define MCP2515_CMD_STATUS_TX1IF   (1<<5)
+#define MCP2515_CMD_STATUS_TX2REQ  (1<<6)
+#define MCP2515_CMD_STATUS_TX2IF   (1<<7)
+
 
 struct mcp2515a_transfers;
 
@@ -134,6 +162,9 @@ struct mcp2515a_priv {
 	/* the DMA Buffer */
 	dma_addr_t transfers_dma_addr;
 	struct mcp2515a_transfers *transfers;
+
+	/* some states */
+	u8 carrier_off;
 };
 
 static const struct can_bittiming_const mcp2515a_bittiming_const = {
@@ -198,50 +229,52 @@ mcp2515a_confirm_device_err:
 		u8 cmd; \
 		u8 reg; \
 		u8 data[datalen]; \
-		struct spi_transfer trans;\
+		struct spi_transfer t_tx;\
 	} name;
-#define TRANSFER_INIT(base,message) \
+#define TRANSFER_INIT(base,message,callback,callbackdata)		\
 	spi_message_init(&base->message.msg);				\
-	base->message.msg.is_dma_mapped=1;
+	base->message.msg.is_dma_mapped=1;				\
+	base->message.msg.complete=callback;				\
+	base->message.msg.context=callbackdata;
 #define TRANSFER_INIT_WRITE(base,message,xfer,regist)			\
 	base->message.xfer.data;					\
 	base->message.xfer.cmd = MCP2515_CMD_WRITE;			\
 	base->message.xfer.reg = regist;				\
-	base->message.xfer.trans.len=2+sizeof(base->message.xfer.data);	\
-	base->message.xfer.trans.tx_buf=&base->message.xfer.cmd;	\
-	base->message.xfer.trans.rx_buf=NULL;				\
-	base->message.xfer.trans.tx_dma=base##_dma_addr			\
+	base->message.xfer.t_tx.len=2+sizeof(base->message.xfer.data);	\
+	base->message.xfer.t_tx.tx_buf=&base->message.xfer.cmd;		\
+	base->message.xfer.t_tx.rx_buf=NULL;				\
+	base->message.xfer.t_tx.tx_dma=base##_dma_addr			\
 		+offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
-	base->message.xfer.trans.rx_dma=0;				\
-	base->message.xfer.trans.cs_change=1;				\
-	spi_message_add_tail(&base->message.xfer.trans,&base->message.msg);
+	base->message.xfer.t_tx.rx_dma=0;				\
+	base->message.xfer.t_tx.cs_change=1;				\
+	spi_message_add_tail(&base->message.xfer.t_tx,&base->message.msg);
 #define TRANSFER_READ_STRUCT(name,datalen) \
 	struct { \
 		u8 cmd; \
 		u8 reg; \
 		u8 data[datalen]; \
-		struct spi_transfer trans_tx;\
-		struct spi_transfer trans_rx;\
+		struct spi_transfer t_tx;\
+		struct spi_transfer t_rx;\
 	} name;
 #define TRANSFER_INIT_READ(base,message,xfer,regist)			\
 	base->message.xfer.data;					\
 	base->message.xfer.cmd = MCP2515_CMD_READ;			\
 	base->message.xfer.reg = regist;				\
-	base->message.xfer.trans_tx.len=2;				\
-	base->message.xfer.trans_tx.tx_buf=&base->message.xfer.cmd; \
-	base->message.xfer.trans_tx.rx_buf=NULL;			\
-	base->message.xfer.trans_tx.tx_dma=base##_dma_addr		\
-		+offsetof(struct mcp2515a_transfers,message.xfer.cmd); \
-	base->message.xfer.trans_rx.rx_dma=0;				\
-	spi_message_add_tail(&base->message.xfer.trans_tx,&base->message.msg); \
-	base->message.xfer.trans_rx.len=sizeof(base->message.xfer.data); \
-	base->message.xfer.trans_rx.rx_buf=&base->message.xfer.data; \
-	base->message.xfer.trans_rx.tx_buf=NULL;			\
-	base->message.xfer.trans_rx.rx_dma=base##_dma_addr		\
+	base->message.xfer.t_tx.len=2;					\
+	base->message.xfer.t_tx.tx_buf=&base->message.xfer.cmd;		\
+	base->message.xfer.t_tx.rx_buf=NULL;				\
+	base->message.xfer.t_tx.tx_dma=base##_dma_addr			\
+		+offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
+	base->message.xfer.t_rx.rx_dma=0;				\
+	spi_message_add_tail(&base->message.xfer.t_tx,&base->message.msg); \
+	base->message.xfer.t_rx.len=sizeof(base->message.xfer.data);	\
+	base->message.xfer.t_rx.rx_buf=&base->message.xfer.data;	\
+	base->message.xfer.t_rx.tx_buf=NULL;				\
+	base->message.xfer.t_rx.rx_dma=base##_dma_addr			\
 		+offsetof(struct mcp2515a_transfers,message.xfer.data); \
-	base->message.xfer.trans_rx.rx_dma=0;				\
-	base->message.xfer.trans_rx.cs_change=1;			\
-	spi_message_add_tail(&base->message.xfer.trans_rx,&base->message.msg);
+	base->message.xfer.t_rx.rx_dma=0;				\
+	base->message.xfer.t_rx.cs_change=1;				\
+	spi_message_add_tail(&base->message.xfer.t_rx,&base->message.msg);
 
 struct mcp2515a_transfers {
 	/* the respective DMA buffers for RX/TX */
@@ -265,25 +298,50 @@ struct mcp2515a_transfers {
 		TRANSFER_WRITE_STRUCT(changetomode,1);
 		TRANSFER_READ_STRUCT(readconfig,8);
 	} config;
+	/* the messages we schedule in response to the mcp2515_irq pin going down */
 	struct {
 		struct spi_message msg;
-		TRANSFER_READ_STRUCT(status,1);/* this actually wastes some memory, but it is minimal, if it really matters at all with structure alignments*/
-		TRANSFER_READ_STRUCT(rxstatus,1);
+		TRANSFER_READ_STRUCT(read_status,1);         /* read the status flags quickly */
+		TRANSFER_READ_STRUCT(read_inte_intf_eflg,3); /* read the interrupt mask, sources and the error flags */
+		TRANSFER_WRITE_STRUCT(clear_inte_intf_eflg,3);         /* clear the interrupts */
 	} read_status;
+	/* the above has a callback, this second is there to allow for HW/SW concurrency
+	 * while the below transfer happens, we may have the time to handle the above information 
+	 * in the callback(irq) handler.
+	 * as the most likley result is that the interrupt source is for a receive of messages,
+	 * we read the message in preparation already, so that we only have to acknowledge it...
+	 */
 	struct {
 		struct spi_message msg;
-		TRANSFER_READ_STRUCT(interr,3);
-		TRANSFER_READ_STRUCT(errcount,2);
-	} read_caninterr;
+		TRANSFER_READ_STRUCT(read_tec_rec,2); 
+		TRANSFER_READ_STRUCT(read_rx0,13);
+	} read_status2;
+	/* the message we send from the callback - this may change depending on status and callbacks*/
 	struct {
 		struct spi_message msg;
-		TRANSFER_READ_STRUCT(rx0,13);
-	} read_rx0;
-	struct {
-		struct spi_message msg;
-		TRANSFER_WRITE_STRUCT(rx0,2); /* this actually wastes some memory, but it is minimal, if it really matters at all with structure alignments*/
-	} clear_rx0;
+		/* acknowledge RX0 - if we need it */
+		TRANSFER_WRITE_STRUCT(ack_rx0,0);
+		/* read+acknowledge RX1 - if we need it */
+		TRANSFER_READ_STRUCT(readack_rx1,13);
+		/* and reenable interrupts by setting the "corresponding" irq_mask */
+		TRANSFER_WRITE_STRUCT(set_irq_mask,1); 
+	} callback_action;
+#if 0		
+		/* add transfers 
+		 * - we also set the priority to send messages in the "correct" order
+		 * - also note the order of TX - TX2 takes precedence over TX1 which takes precedence over TX0 assuming all got the same priority
+		 * not sure if we need it here really, we could handle it (blocking - if allowed in context) in the tx message handler...
+		 */
+		TRANSFER_WRITE_STRUCT(setTX2,14);
+		TRANSFER_WRITE_STRUCT(setTX1,14);
+		TRANSFER_WRITE_STRUCT(setTX0,14);
+#endif
 };
+
+/* the complete callbacks and interrupt handlers */
+static irqreturn_t mcp2515a_interrupt_handler(int, void *);
+static void mcp2515a_completed_read_status (void *);
+static void mcp2515a_completed_transfers (void *);
 
 static void mcp2515a_free_transfers(struct net_device* net)
 {
@@ -311,7 +369,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* now let us fill in the data structures */
 
 	/* setting up receive policies for buffers */
-	TRANSFER_INIT(priv->transfers,config);
+	TRANSFER_INIT(priv->transfers,config,NULL,NULL);
 	data=TRANSFER_INIT_WRITE(priv->transfers,config,setRXB0ctrl       ,MCP2515_REG_RXB0CTRL);
 	data[0]=MCP2515_REG_RXB_RXM_ANY /* receive any message */
                 | MCP2515_REG_RXB_BUKT; /* rollover to RXB1*/
@@ -341,7 +399,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	data[1]=0; /* TXRTSCTRL - no functionality*/
 
 	/* configure CNF and interrupt-registers */
-	data=TRANSFER_INIT_WRITE(priv->transfers,config,setconfig     ,MCP2515_REG_CNF3);
+	data=TRANSFER_INIT_WRITE(priv->transfers,config,setconfig        ,MCP2515_REG_CNF3);
 	data[0]=data[1]=data[2]=0; /* CNF3,CNF2,CNF1 */
 	data[3]=0xff; /* INTE - enable all interupt sources */
 	data[4]=0; /* INTF - clear all interupt sources */
@@ -353,21 +411,42 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* initiate read of basic configs */
 	data=TRANSFER_INIT_READ(priv->transfers,config,readconfig        ,MCP2515_REG_CNF3);
 
-	/* The read status transfer */
-	TRANSFER_INIT(priv->transfers,read_status);
-	priv->transfers->read_status.msg.complete=NULL;
-	data=TRANSFER_INIT_READ(priv->transfers,read_status,status       ,MCP2515_REG_CANCTRL);
-	priv->transfers->read_status.status.cmd=MCP2515_CMD_STATUS;
-	priv->transfers->read_status.status.trans_tx.len=1;
-	data=TRANSFER_INIT_READ(priv->transfers,read_status,rxstatus     ,MCP2515_REG_CANCTRL);
-	priv->transfers->read_status.rxstatus.cmd=MCP2515_CMD_RXSTATUS;
-	priv->transfers->read_status.rxstatus.trans_tx.len=1;
+	/* The read status transfer with the callback */
+	TRANSFER_INIT(priv->transfers,read_status,mcp2515a_completed_read_status,net);
+	/* add the STATUS read transfer - we modify the length and command */
+	data=TRANSFER_INIT_READ(priv->transfers,read_status,read_status         ,MCP2515_REG_CANCTRL);
+	priv->transfers->read_status.read_status.cmd=MCP2515_CMD_STATUS;
+	priv->transfers->read_status.read_status.t_tx.len=1;
+	/* add the read interrupts and error registers */
+	data=TRANSFER_INIT_READ(priv->transfers,read_status,read_inte_intf_eflg  ,MCP2515_REG_CANINTE);
+	/* and clear the interrupt mask, so no more IRQ occurs */
+	data=TRANSFER_INIT_WRITE(priv->transfers,read_status,clear_inte_intf_eflg,MCP2515_REG_CANINTE);
+	data[0]=0;
+	data[1]=0;
+	data[2]=0;
 
-	/* the caninterr values */
-	TRANSFER_INIT(priv->transfers,read_caninterr);
-	/* possibly also set interrupts disabled here - where exactly? - there could be a race condition !*/
-	data=TRANSFER_INIT_READ(priv->transfers,read_caninterr,interr         ,MCP2515_REG_CANINTE);
-	data=TRANSFER_INIT_READ(priv->transfers,read_caninterr,errcount       ,MCP2515_REG_TEC);
+	/* the second status message that gets scheduled - this time without callbacks ... */
+	TRANSFER_INIT(priv->transfers,read_status2,NULL,NULL);
+	/* we read the error-count */
+	data=TRANSFER_INIT_READ(priv->transfers,read_status2,read_tec_rec       ,MCP2515_REG_TEC);
+	/* and we read the RX0 buffer... */
+	data=TRANSFER_INIT_READ(priv->transfers,read_status2,read_rx0          ,MCP2515_REG_RXB0CTRL+1);
+
+	/* and the calcback action transfer 
+	 * note that we will need to change the order in which we run this dependent on status flags from above
+	 */
+	TRANSFER_INIT(priv->transfers,callback_action,mcp2515a_completed_transfers,net);
+	/* acknowledge the RX0 buffer - if we want to support a mcp2510, we may to change the below */
+	data=TRANSFER_INIT_WRITE(priv->transfers,callback_action,ack_rx0       ,0);
+	priv->transfers->callback_action.ack_rx0.cmd=MCP2515_CMD_READ_RX(0);
+	priv->transfers->callback_action.ack_rx0.t_tx.len=1;
+	/* read and acknowledge rx1 */
+	data=TRANSFER_INIT_READ(priv->transfers,callback_action,readack_rx1  ,0);
+	priv->transfers->callback_action.readack_rx1.cmd=MCP2515_CMD_READ_RX(1);
+	priv->transfers->callback_action.readack_rx1.t_tx.len=1;
+	/* and set the IRQ mask back again */
+	data=TRANSFER_INIT_WRITE(priv->transfers,callback_action,set_irq_mask ,MCP2515_REG_CANINTE);
+	data[0]=0xff;
 
 	/* and return ok */
 	return 0;
@@ -433,15 +512,89 @@ static int mcp2515a_do_set_mode(struct net_device *net, enum can_mode mode)
 	return -EOPNOTSUPP;
 }
 
+void mcp2515a_completed_read_status (void* context) 
+{
+	 struct net_device *net = context;
+	 struct mcp2515a_priv *priv = netdev_priv(net);
+	 struct mcp2515a_transfers *trans = priv->transfers;
+	 /* get the status bits */
+	 u8 status=trans->read_status.read_status.data[0];
+	 /*
+	 u8 inte=trans->read_status.read_inte_intf_eflg.data[0];
+	 u8 intf=trans->read_status.read_inte_intf_eflg.data[1];
+	 */
+	 u8 eflg=trans->read_status.read_inte_intf_eflg.data[2];
+	 /* first initialise the message */
+	 spi_message_init(&trans->callback_action.msg);
+	 /* enable interrupts on MCP2515 */
+	 spi_message_add_tail(&trans->callback_action.set_irq_mask.t_tx,&trans->callback_action.msg);
+	 /* and based on this handle our needs */
+	 if (status & MCP2515_CMD_STATUS_RX0IF ) {
+		 /* we can not schedule the transfer to the network stack yet 
+		  * the transaction to read the message is (probably) still in flight, 
+		  * but we can already schedule the ACK for it
+		 */
+		 spi_message_add_tail(&trans->callback_action.ack_rx0.t_tx,&trans->callback_action.msg);
+	 }
+	 if (status & MCP2515_CMD_STATUS_RX1IF ) {
+		 /* schedule the TX/RX portion of reading RX1 */
+		 spi_message_add_tail(&trans->callback_action.readack_rx1.t_tx,&trans->callback_action.msg);
+		 spi_message_add_tail(&trans->callback_action.readack_rx1.t_rx,&trans->callback_action.msg);
+	 }
+
+	 /* schedule the transfer */
+	 spi_async(priv->spi,&trans->callback_action.msg);
+	 
+	 /* and enable our own interrupts as well */
+	 enable_irq(priv->spi->irq);
+
+	 /* now handle the error situations - if such have occurred */
+	 if (eflg&(MCP2515_REG_EFLG_RX0OVR|MCP2515_REG_EFLG_RX1OVR)) {
+		 /* increment counters */
+		 net->stats.rx_over_errors++;
+		 net->stats.rx_errors++;
+	 }
+	 /* the error handler for CAN BUS problems */
+	 if (eflg&(MCP2515_REG_EFLG_TXEP|MCP2515_REG_EFLG_TXEP)) {
+		 if (!priv->carrier_off) {
+			 dev_err(&net->dev,"CAN-Bus-error detected - Error-flags: 0x%02x\n",eflg);
+			 netif_carrier_off(net);
+			 priv->carrier_off=1;
+			 /* maybe reset here? */
+			 /* maybe change "interrupt-mask" ? */
+		 }
+	 } else {
+		 /* otherwise clear the message */
+		 if (priv->carrier_off) {
+			 dev_err(&net->dev,"CAN-Bus-error recovered\n");
+			 netif_carrier_on(net);
+		 }
+	 }
+}
+
+void mcp2515a_completed_transfers (void *context)
+{
+	struct net_device *dev = context;
+	struct mcp2515a_priv *priv = netdev_priv(dev);
+	//struct mcp2515a_transfers *trans = priv->transfers;
+	/* reenable interrupt handler */
+	enable_irq(priv->spi->irq);
+	/* and schedule RX0,RX1 to network stack - if needed */
+	
+}
+
 /* the interrupt-handler for this device */
 static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 {
-        //struct net_device *net = dev_id;
-        //struct mcp2515a_priv *priv = netdev_priv(net);
-	printk(KERN_DEBUG "Interrupt handled\n");
-	/* we will just schedule a transfer */
+        struct net_device *net = dev_id;
+        struct mcp2515a_priv *priv = netdev_priv(net);
+        struct spi_device *spi = priv->spi;
+	/* we will just schedule the 2 status transfers (of which the first generates a callback, while the second is just pending...) */
+	spi_async(spi,&priv->transfers->read_status.msg);
+	spi_async(spi,&priv->transfers->read_status2.msg);
 	/* disable the interrupt - one of the handlers we reenable it*/
 	disable_irq_nosync(irq);
+
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
@@ -459,7 +612,7 @@ static int mcp2515a_open(struct net_device *net)
         struct spi_device *spi = priv->spi;
 	struct mcp251x_platform_data *pdata = spi->dev.platform_data;
         int ret;
-	int flags=IRQF_ONESHOT;
+	int flags=0;
 
 	/* just in case identify the device again */
         ret = mcp2515a_confirm_device(spi);
@@ -473,9 +626,13 @@ static int mcp2515a_open(struct net_device *net)
 
 	/* the interrupt flag calculation */
 	if (pdata->irq_flags)
-		flags |= pdata->irq_flags;
+		flags = pdata->irq_flags;
 	else
-		flags |= IRQF_TRIGGER_FALLING;
+		/* this does not work for some reason - at least not on the RPI:
+		 * flags |= IRQF_TRIGGER_LOW;
+		 * so we are having to "cope" with edge-interrupts, which may bring other problems...
+		 */
+		 flags = IRQF_TRIGGER_FALLING;
 
 	/* request the IRQ with the above flags */
         ret = request_irq(spi->irq, 
