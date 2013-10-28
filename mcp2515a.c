@@ -528,7 +528,7 @@ static int mcp2515a_do_set_mode(struct net_device *net, enum can_mode mode)
 	return -EOPNOTSUPP;
 }
 
-void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
+static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 {
         struct sk_buff *skb;
         struct can_frame *frame;
@@ -571,7 +571,7 @@ void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 		|(data[MCP2515_MSG_SIDL]>>5)
 		;
 	/* get data length */
-	frame->can_dlc=data[MCP2515_MSG_DCL]&MCP2515_MSG_DCL_MASK;
+	frame->can_dlc=get_can_dlc( data[MCP2515_MSG_DCL]&MCP2515_MSG_DCL_MASK);
 
 	/* copy data */
 	memcpy(frame->data,data+MCP2515_MSG_DATA,frame->can_dlc);
@@ -586,48 +586,27 @@ void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 	netif_rx_ni(skb);
 }
 
-void mcp2515a_completed_read_status (void* context) 
+static void mcp2515a_completed_read_status_error (struct net_device *net) 
 {
-	struct net_device *net = context;
 	struct mcp2515a_priv *priv = netdev_priv(net);
 	struct mcp2515a_transfers *trans = priv->transfers;
-	/* get the status bits */
-	u8 status=trans->read_status.read_status.data[0];
+	/* some status registers, we may need... */
 	/*
 	  u8 inte=trans->read_status.read_inte_intf_eflg.data[0];
 	  u8 intf=trans->read_status.read_inte_intf_eflg.data[1];
 	*/
 	u8 eflg=trans->read_status.read_inte_intf_eflg.data[2];
-	/* first initialise the message transfers back to 0 */
-	INIT_LIST_HEAD(&trans->callback_action.msg.transfers);
-	
-	/* enable interrupts on MCP2515 */
-	spi_message_add_tail(&trans->callback_action.set_irq_mask.t_tx,&trans->callback_action.msg);
-	/* and based on this handle our needs */
-	if (status & MCP2515_CMD_STATUS_RX0IF ) {
-		/* we can not schedule the transfer to the network stack yet 
-		 * the transaction to read the message is (probably) still in flight, 
-		 * but we can already schedule the ACK for it
-		 */
-		spi_message_add_tail(&trans->callback_action.ack_rx0.t_tx,&trans->callback_action.msg);
-	}
-	if (status & MCP2515_CMD_STATUS_RX1IF ) {
-		/* schedule the TX/RX portion of reading RX1 */
-		spi_message_add_tail(&trans->callback_action.readack_rx1.t_tx,&trans->callback_action.msg);
-		spi_message_add_tail(&trans->callback_action.readack_rx1.t_rx,&trans->callback_action.msg);
-	}
-	
-	/* schedule the transfer */
-	spi_async(priv->spi,&trans->callback_action.msg);
-	
-	/* and enable our own interrupts as well */
-	enable_irq(priv->spi->irq);
-	
-	/* now handle the error situations - if such have occurred */
+	/* the error flags */
+	u32 err_id=0;
+	u8 err_detail=0;
+	/* overflow occurred */
 	if (eflg&(MCP2515_REG_EFLG_RX0OVR|MCP2515_REG_EFLG_RX1OVR)) {
 		/* increment counters */
 		net->stats.rx_over_errors++;
 		net->stats.rx_errors++;
+		/* add bits */
+		err_id |= CAN_ERR_CRTL;
+		err_detail |= CAN_ERR_CRTL_RX_OVERFLOW;
 	}
 	/* the error handler for CAN BUS problems */
 	if (eflg&(MCP2515_REG_EFLG_TXEP|MCP2515_REG_EFLG_TXEP)) {
@@ -646,6 +625,60 @@ void mcp2515a_completed_read_status (void* context)
 			priv->carrier_off=0;
 		}
 	}
+	/* and deliver the error message if there is some data...*/
+	if (err_id) {
+		struct sk_buff *skb;
+		struct can_frame *frame;
+		
+		/* allocate a frame to deliver */
+		skb = alloc_can_err_skb(priv->net, &frame);
+		if (!skb) {
+			netdev_err(priv->net, "cannot allocate error message\n");
+			return;
+		}
+		/* assign data to it */
+		frame->can_id |= err_id;
+		frame->data[1] = err_detail;
+		/* and deliver it */
+		netif_rx_ni(skb);
+	}
+}
+static void mcp2515a_completed_read_status (void* context) 
+{
+	struct net_device *net = context;
+	struct mcp2515a_priv *priv = netdev_priv(net);
+	struct mcp2515a_transfers *trans = priv->transfers;
+	/* get the status bits */
+	u8 status=trans->read_status.read_status.data[0];
+	/* first initialise the message transfers back to 0 */
+	INIT_LIST_HEAD(&trans->callback_action.msg.transfers);
+	
+	/* enable interrupts on MCP2515 */
+	spi_message_add_tail(&trans->callback_action.set_irq_mask.t_tx,&trans->callback_action.msg);
+	/* and based on this handle our needs */
+	if (status & MCP2515_CMD_STATUS_RX0IF ) {
+		/* we can not schedule the transfer to the network stack yet 
+		 * the transaction to read the message is (probably) still in flight, 
+		 * but we can already schedule the ACK for it
+		 */
+		spi_message_add_tail(&trans->callback_action.ack_rx0.t_tx,&trans->callback_action.msg);
+	}
+	if (status & MCP2515_CMD_STATUS_RX1IF ) {
+		/* schedule the TX/RX portion of reading RX1 */
+		spi_message_add_tail(&trans->callback_action.readack_rx1.t_tx,&trans->callback_action.msg);
+		spi_message_add_tail(&trans->callback_action.readack_rx1.t_rx,&trans->callback_action.msg);
+	}
+
+	/* and enable our own interrupts before actually scheduling the transfer 
+	* this is happening here (hopefully) avoiding a race condition...
+	*/
+	enable_irq(priv->spi->irq);
+
+	/* schedule the transfer */
+	spi_async(priv->spi,&trans->callback_action.msg);
+	
+	/* now handle the error situations - if such have occurred */
+	mcp2515a_completed_read_status_error(net);
 }
 
 void mcp2515a_completed_transfers (void *context)
