@@ -773,6 +773,7 @@ void mcp2515a_completed_transfers (void *context)
 	}
 	/* and schedule RX1 to network stack */
 	if (status & MCP2515_CMD_STATUS_RX1IF ) {
+		priv->net->stats.rx_fifo_errors++;
 		mcp2515a_queue_rx_message(priv,trans->callback_action[structure].readack_rx1.data);
 	}
 }
