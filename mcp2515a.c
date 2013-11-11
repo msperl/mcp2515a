@@ -72,7 +72,7 @@
 #define MCP2515_REG_CANCTRL_CLKPRE_2       (1)
 #define MCP2515_REG_CANCTRL_CLKPRE_4       (2)
 #define MCP2515_REG_CANCTRL_CLKPRE_8       (3)
-  
+
 #define MCP2515_REG_CNF3          0x28
 #define MCP2515_REG_CNF2          0x29
 #define MCP2515_REG_CNF1          0x2A
@@ -247,7 +247,7 @@ int mcp2515a_confirm_device(struct spi_device *spi)
 
 mcp2515a_confirm_device_err:
 	dev_err(&spi->dev,
-		"Found unexpected response from device: CANSTAT 0x%02x CANCTRL 0x%02x - not detected\n", 
+		"Found unexpected response from device: CANSTAT 0x%02x CANCTRL 0x%02x - not detected\n",
 		b[2], b[3]);
 	return -ENODEV;
 }
@@ -307,7 +307,7 @@ mcp2515a_confirm_device_err:
 extern int bcm2835dma_spi_prepare_message(struct spi_device*,struct spi_message*);
 extern int bcm2835dma_spi_unprepare_message(struct spi_device*,struct spi_message*);
 #if 0
-#define SPI_PREPARE_MESSAGE(spi,msg) 
+#define SPI_PREPARE_MESSAGE(spi,msg)
 #define SPI_UNPREPARE_MESSAGE(spi,msg)
 #else
 #define SPI_PREPARE_MESSAGE(spi,msg) bcm2835dma_spi_prepare_message(spi,msg)
@@ -335,14 +335,14 @@ struct mcp2515a_transfers {
 		TRANSFER_WRITE_STRUCT(clear_inte,1);         /* clear the interrupts */
 	} read_status;
 	/* the above has a callback, this second is there to allow for HW/SW concurrency
-	 * while the below transfer happens, we may have the time to handle the above information 
+	 * while the below transfer happens, we may have the time to handle the above information
 	 * in the callback(irq) handler.
 	 * as the most likley result is that the interrupt source is for a receive of messages,
 	 * we read the message in preparation already, so that we only have to acknowledge it...
 	 */
 	struct {
 		struct spi_message msg;
-		TRANSFER_READ_STRUCT(read_tec_rec,2); 
+		TRANSFER_READ_STRUCT(read_tec_rec,2);
 		TRANSFER_READ_STRUCT(read_rx0,13);
 		TRANSFER_READ_STRUCT(read_status,1);
 	} read_status2;
@@ -353,13 +353,13 @@ struct mcp2515a_transfers {
 	struct {
 		struct spi_message msg;
 		/* clear overflow flags if needed */
-		TRANSFER_WRITE_STRUCT(clear_rxoverflow,2);		
+		TRANSFER_WRITE_STRUCT(clear_rxoverflow,2);
 		/* acknowledge RX0 - if we need it */
 		TRANSFER_WRITE_STRUCT(ack_rx0,0);
 		/* read+acknowledge RX1 - if we need it */
 		TRANSFER_READ_STRUCT(readack_rx1,13);
 		/* and reenable interrupts by setting the "corresponding" irq_mask */
-		TRANSFER_WRITE_STRUCT(set_irq_mask,1); 
+		TRANSFER_WRITE_STRUCT(set_irq_mask,1);
 	} callback_action[8];
 	/* the transfers */
 	struct {
@@ -403,7 +403,7 @@ static void mcp2515a_free_transfers(struct net_device* net)
 		SPI_UNPREPARE_MESSAGE(spi,&priv->transfers->transmit_tx0.msg);
 		/* now release the structures */
 		dma_free_coherent(&priv->spi->dev,
-				sizeof(struct mcp2515a_transfers), 
+				sizeof(struct mcp2515a_transfers),
 				priv->transfers,
 				priv->transfers_dma_addr);
 	}
@@ -416,7 +416,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
         struct device *dev = &spi->dev;
 	u8* data;
 	int i;
-	/* first forece the coherent mask 
+	/* first forece the coherent mask
 	   - a bit of a hack, but at least it works... */
         dev->coherent_dma_mask = 0xffffffff;
 
@@ -543,8 +543,6 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	return 0;
 }
 
-
-
 static int mcp2515a_config(struct net_device *net)
 {
         struct mcp2515a_priv *priv = netdev_priv(net);
@@ -573,12 +571,12 @@ static int mcp2515a_config(struct net_device *net)
 	/* CNF2 */
 	priv->transfers->config.setconfig.data[1]=
 		(priv->can.ctrlmode & CAN_CTRLMODE_3_SAMPLES ? 0xc0 : 0x80)
-		| (bt->phase_seg1 - 1) << 3 
+		| (bt->phase_seg1 - 1) << 3
 		| (bt->prop_seg - 1)
 		;
 	/* CNF1 */
 	priv->transfers->config.setconfig.data[2]=
-		(bt->sjw - 1) << 6 
+		(bt->sjw - 1) << 6
 		| (bt->brp - 1);
 
 	/* execute transfer */
@@ -626,7 +624,7 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 	if (data[MCP2515_MSG_SIDL]|MCP2515_MSG_SIDL_IDE) {
 		frame->can_id|=
 			/* the extended flag */
-			CAN_EFF_FLAG 
+			CAN_EFF_FLAG
 			/* RTR */
 			| ((data[MCP2515_MSG_DCL]&MCP2515_MSG_DCL_RTR)?CAN_RTR_FLAG:0)
 			/* the extended Address - top 2 bits */
@@ -655,7 +653,7 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 
 	/* increment byte counters */
         priv->net->stats.rx_bytes += frame->can_dlc;
-	
+
 	/* call can_led_event */
 	can_led_event(priv->net, CAN_LED_EVENT_RX);
 
@@ -663,7 +661,7 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 	netif_rx_ni(skb);
 }
 
-static void mcp2515a_completed_read_status_error (struct net_device *net) 
+static void mcp2515a_completed_read_status_error (struct net_device *net)
 {
 	struct mcp2515a_priv *priv = netdev_priv(net);
 	struct mcp2515a_transfers *trans = priv->transfers;
@@ -686,9 +684,10 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 		err_detail |= CAN_ERR_CRTL_RX_OVERFLOW;
 	}
 	/* the error handler for CAN BUS problems */
-	if (eflg&(MCP2515_REG_EFLG_TXEP|MCP2515_REG_EFLG_TXEP)) {
+	if (eflg&(MCP2515_REG_EFLG_TXEP|MCP2515_REG_EFLG_RXEP)) {
 		if (!priv->carrier_off) {
 			dev_err(&net->dev,"CAN-Bus-error detected - Error-flags: 0x%02x\n",eflg);
+			priv->net->stats.tx_carrier_errors++;
 			netif_carrier_off(net);
 			priv->carrier_off=1;
 			/* maybe reset here? */
@@ -706,7 +705,7 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 	if (err_id) {
 		struct sk_buff *skb;
 		struct can_frame *frame;
-		
+
 		/* allocate a frame to deliver */
 		skb = alloc_can_err_skb(priv->net, &frame);
 		if (!skb) {
@@ -720,7 +719,8 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 		netif_rx_ni(skb);
 	}
 }
-static void mcp2515a_completed_read_status (void* context) 
+
+static void mcp2515a_completed_read_status (void* context)
 {
 	struct net_device *net = context;
 	struct mcp2515a_priv *priv = netdev_priv(net);
@@ -739,7 +739,7 @@ static void mcp2515a_completed_read_status (void* context)
 		structure|=CALLBACK_ACK_RX0;
 	if (status & MCP2515_CMD_STATUS_RX1IF )
 		structure|=CALLBACK_READACK_RX1;
-	/* and enable our own interrupts before actually scheduling the transfer 
+	/* and enable our own interrupts before actually scheduling the transfer
 	* this is happening here (hopefully) avoiding a race condition...
 	*/
 	enable_irq(priv->spi->irq);
@@ -748,7 +748,7 @@ static void mcp2515a_completed_read_status (void* context)
 	spi_async(priv->spi,&trans->callback_action[structure].msg);
 	/* and assign it for the callback */
 	priv->structure_used=structure;
-	
+
 	/* copy status back to tx_status */
 	priv->tx_status=status&(MCP2515_CMD_STATUS_TX0REQ|MCP2515_CMD_STATUS_TX1REQ|MCP2515_CMD_STATUS_TX2REQ);
 	/* and wake up if there are some bits NOT set */
@@ -800,8 +800,6 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 				struct net_device *net)
 {
-        struct mcp2515_priv *priv = netdev_priv(net);
-	u8 tx;
 	/* check some messages */
         if (can_dropped_invalid_skb(net, skb))
                 return NETDEV_TX_OK;
@@ -826,7 +824,7 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	 * but then - as soon as TX2,TX1,TX0 are all "empty" the Priority gets reset back to highest
 	 * this should allow to delay the full idle-delay delay for a lot longer...
 	 * this is the drawback of making sure that TX packets get sent out in sequence under any circumstances...
-	 *  we could provide an option to avoid this penalty by adding 
+	 *  we could provide an option to avoid this penalty by adding
 	 * a module parameter to ignore these delays and schedule immediately...
 	 *
 	 * for most practical purposes we will just schedule the message directly via SPI
@@ -840,9 +838,9 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 #if 1
 	return NETDEV_TX_BUSY;
 #else
-	if (!try_wait_for_completion(&priv->can_transfer)) 
+	if (!try_wait_for_completion(&priv->can_transfer))
 		return NETDEV_TX_BUSY;
-	
+
 	/* first check on priority reset back to 3 */
 	if (priv->tx_status==0)
 		priv->tx_priority=3;
@@ -892,10 +890,10 @@ static int mcp2515a_open(struct net_device *net)
 		 flags = IRQF_TRIGGER_FALLING;
 
 	/* request the IRQ with the above flags */
-        ret = request_irq(spi->irq, 
+        ret = request_irq(spi->irq,
 			mcp2515a_interrupt_handler,
 			flags,
-			net->name, 
+			net->name,
 			net);
         if (ret)
                 goto err_candev;
@@ -956,7 +954,7 @@ static int mcp2515a_probe(struct spi_device *spi)
         int ret;
 
 	/* Platform data is required for osc freq */
-	if (!pdata) 
+	if (!pdata)
 		return -ENODEV;
 
 	/* check for device to be present */
@@ -966,7 +964,7 @@ static int mcp2515a_probe(struct spi_device *spi)
 
 	/* allocate the CAN structure */
 	net = alloc_candev(sizeof(struct mcp2515a_priv),1);
-        if (!net) 
+        if (!net)
 		return -ENOMEM;
 
 	/* copy the driver data */
@@ -986,9 +984,9 @@ static int mcp2515a_probe(struct spi_device *spi)
 	priv->net = net;
         priv->can.clock.freq = pdata->oscillator_frequency / 2;
 	priv->can.bittiming_const = & mcp2515a_bittiming_const;
-        priv->can.ctrlmode_supported = 
+        priv->can.ctrlmode_supported =
 		CAN_CTRLMODE_3_SAMPLES
-                | CAN_CTRLMODE_LOOPBACK 
+                | CAN_CTRLMODE_LOOPBACK
 		| CAN_CTRLMODE_LISTENONLY
 		| CAN_CTRLMODE_ONE_SHOT ;
         priv->can.do_set_mode = mcp2515a_do_set_mode;
@@ -998,7 +996,7 @@ static int mcp2515a_probe(struct spi_device *spi)
 
 	/* allocate some buffers from DMA space */
 	ret=mcp2515a_init_transfers(net);
-	if (ret) 
+	if (ret)
 		goto error_out;
 
 	/* and register the device */
@@ -1086,4 +1084,3 @@ module_exit(mcp2515a_exit);
 MODULE_DESCRIPTION("Driver for Microchip MCP2515 SPI CAN controller using asyncronous SPI-calls");
 MODULE_AUTHOR("Martin Sperl");
 MODULE_LICENSE("GPL");
-
