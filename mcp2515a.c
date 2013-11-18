@@ -193,6 +193,8 @@ struct mcp2515a_priv {
 
 	/* some states */
 	u8 carrier_off;
+	/* flag to say we are shutting down */
+	u8 is_shutdown;
 };
 
 static const struct can_bittiming_const mcp2515a_bittiming_const = {
@@ -468,7 +470,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* add the STATUS read transfer - we modify the length and command */
 	data=TRANSFER_INIT_READ(priv->transfers,read_status,read_status          ,0);
 	priv->transfers->read_status.read_status.cmd=MCP2515_CMD_STATUS;
-	priv->transfers->read_status.read_status.t_tx.len=1;
+	priv->transfers->read_status.read_status.t_tx.len=2;
 	/* add the read interrupts and error registers */
 	data=TRANSFER_INIT_READ(priv->transfers,read_status,read_inte_intf_eflg  ,MCP2515_REG_CANINTE);
 	/* and clear the interrupt mask, so no more IRQ occurs */
@@ -730,6 +732,9 @@ static void mcp2515a_completed_read_status (void* context)
 	u8 eflg=trans->read_status.read_inte_intf_eflg.data[2];
 	/* structure to use*/
 	u8 structure=0;
+	/* return early if we are shutdown */
+	if (priv->is_shutdown)
+		return;
 	/* increment callback counter */
 	priv->status_callback_count++;
 	/* decide which structure we use */
@@ -767,6 +772,9 @@ void mcp2515a_completed_transfers (void *context)
 	u8 structure=priv->structure_used;
 	/* get the status bits */
 	u8 status=trans->read_status.read_status.data[0];
+	/* return early if we are shutdown */
+	if (priv->is_shutdown)
+		return;
 	/* and schedule RX0 to network stack */
 	if (status & MCP2515_CMD_STATUS_RX0IF ) {
 		mcp2515a_queue_rx_message(priv,trans->read_status2.read_rx0.data);
@@ -785,12 +793,15 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
 	/* we will just schedule the 2 status transfers (of which the first generates a callback, while the second is just pending...) */
-	spi_async(spi,&priv->transfers->read_status.msg);
-	spi_async(spi,&priv->transfers->read_status2.msg);
-	/* increment sent counter */
-	priv->status_sent_count++;
+	if (!priv->is_shutdown) {
+		spi_async(spi,&priv->transfers->read_status.msg);
+		spi_async(spi,&priv->transfers->read_status2.msg);
+		
+		/* increment sent counter */
+		priv->status_sent_count++;
+	}
 
-	/* disable the interrupt - one of the handlers we reenable it*/
+	/* disable the interrupt - one of the handlers will reenable it */
 	disable_irq_nosync(irq);
 
 	/* return with a andled interrupt */
@@ -912,10 +923,10 @@ static int mcp2515a_open(struct net_device *net)
         return 0;
 
 err_irq:
-	/* send a syncronous reset */
-	mcp2515a_reset(spi);
 	/* and free the IRQ */
         free_irq(spi->irq, net);
+	/* send a syncronous reset */
+	mcp2515a_reset(spi);
 err_candev:
 	/* and close the device */
 	close_candev(net);
@@ -927,13 +938,17 @@ static int mcp2515a_stop(struct net_device *dev)
 {
         struct mcp2515a_priv *priv = netdev_priv(dev);
         struct spi_device *spi = priv->spi;
+	/* mark us as shut down */
+	priv->is_shutdown=1;
 
-	/* send a syncronous reset */
+	/* first free the interrupt */
+        free_irq(spi->irq, dev);
+
+	/* send a syncronous reset - anything that is in-flight should stop after this...*/
         mcp2515a_reset(spi);
+
 	/* close the device */
         close_candev(dev);
-	/* free the interrupt */
-        free_irq(spi->irq, dev);
 	/* and return OK */
         return 0;
 }
@@ -1016,10 +1031,13 @@ error_out:
 static int mcp2515a_remove(struct spi_device *spi)
 {
         struct net_device *net = dev_get_drvdata(&spi->dev);
-	/* free the memory */
-	mcp2515a_free_transfers(net);
+	/* unregister the device */
         unregister_candev(net);
+	/* free the memory for generated SPI messages*/
+	mcp2515a_free_transfers(net);
+	/* clear driver data */
         dev_set_drvdata(&spi->dev, NULL);
+	/* free the device finally */
         free_candev(net);
 	/* and return OK */
         return 0;
