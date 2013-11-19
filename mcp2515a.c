@@ -308,7 +308,7 @@ mcp2515a_confirm_device_err:
 
 extern int bcm2835dma_spi_prepare_message(struct spi_device*,struct spi_message*);
 extern int bcm2835dma_spi_unprepare_message(struct spi_device*,struct spi_message*);
-#if 0
+#if 1
 #define SPI_PREPARE_MESSAGE(spi,msg)
 #define SPI_UNPREPARE_MESSAGE(spi,msg)
 #else
@@ -515,7 +515,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 		}
 		/* and set the IRQ mask back again */
 		data=TRANSFER_INIT_WRITE(priv->transfers,callback_action[i],set_irq_mask ,MCP2515_REG_CANINTE);
-		data[0]=0xff;
+		data[0]=0x3f;
 		/* and prepare the message */
 		SPI_PREPARE_MESSAGE(spi,&priv->transfers->callback_action[i].msg);
 	}
