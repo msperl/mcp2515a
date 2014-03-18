@@ -45,10 +45,35 @@
 
 static bool use_optimize = 1;
 module_param(use_optimize, bool, 0);
-MODULE_PARM_DESC(use_optimize, "Run the driver with spi_message_compile support");
+MODULE_PARM_DESC(use_optimize,
+		"Run the driver with spi_message_compile support");
 
-#define spi_message_optimize(...)
-#define spi_message_unoptimize(...)
+#ifdef SPI_HAVE_OPTIMIZE
+#define SPI_MESSAGE_OPTIMIZE(spi,message) if (use_optimize) spi_message_optimize(spi,message)
+#else
+#define SPI_MESSAGE_OPTIMIZE(spi,message)
+#endif
+
+/* some functions to measure delays on a logic analyzer
+ * note: needs to get run first from non-atomic context!!! */
+static int debugpin = 0;
+module_param(debugpin,int,0);
+MODULE_PARM_DESC(debugpin,"the pin that we should toggle");
+static u32* gpio=0;
+static void set_low(void) {
+	if (debugpin) {
+		if (!gpio)
+			gpio = ioremap(0x20200000, SZ_16K);
+		gpio[0x28/4]=debugpin;
+	}
+}
+static void set_high(void) {
+	if (debugpin) {
+		if (!gpio)
+			gpio = ioremap(0x20200000, SZ_16K);
+		gpio[0x1C/4]=debugpin;
+	}
+}
 
 /* the MCP commands */
 #define MCP2515_CMD_WRITE         0x02
@@ -405,23 +430,25 @@ static void mcp2515a_free_transfers(struct net_device* net)
 	/* if we have been prepared, then release us */
 	if (priv->transfers) {
 		/* first unprepare messages */
-		spi_message_unoptimize(spi,
-				&priv->transfers->config.msg);
-		spi_message_unoptimize(spi,
-				&priv->transfers->read_status.msg);
-		spi_message_unoptimize(spi,
-				&priv->transfers->read_status2.msg);
+#ifdef SPI_HAVE_OPTIMIZE
+		printk(KERN_INFO "Unoptimize config\n");
+		spi_message_unoptimize(&priv->transfers->config.msg);
+		printk(KERN_INFO "Unoptimize status\n");
+		spi_message_unoptimize(&priv->transfers->read_status.msg);
+		printk(KERN_INFO "Unoptimize status2\n");
+		spi_message_unoptimize(&priv->transfers->read_status2.msg);
 		for( i=0 ; i<8 ; i++) {
+			printk(KERN_INFO "Unoptimize callback_action %i\n",i);
 			spi_message_unoptimize(
-				spi,
 				&priv->transfers->callback_action[i].msg);
 		}
-		spi_message_unoptimize(spi,
-				&priv->transfers->transmit_tx2.msg);
-		spi_message_unoptimize(spi,
-				&priv->transfers->transmit_tx1.msg);
-		spi_message_unoptimize(spi,
-				&priv->transfers->transmit_tx0.msg);
+		printk(KERN_INFO "Unoptimize tx2\n");
+		spi_message_unoptimize(&priv->transfers->transmit_tx2.msg);
+		printk(KERN_INFO "Unoptimize tx1\n");
+		spi_message_unoptimize(&priv->transfers->transmit_tx1.msg);
+		printk(KERN_INFO "Unoptimize tx0\n");
+		spi_message_unoptimize(&priv->transfers->transmit_tx0.msg);
+#endif
 		/* now release the structures */
 		dma_free_coherent(&priv->spi->dev,
 				sizeof(struct mcp2515a_transfers),
@@ -508,11 +535,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				config,
 				readconfig,
 				MCP2515_REG_CNF3);
-
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->config.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->config.msg);
 
 	/* The read status transfer with the callback */
 	TRANSFER_INIT(priv->transfers,
@@ -538,10 +561,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				clear_inte,
 				MCP2515_REG_CANINTE);
 	data[0] = 0;
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->read_status.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->read_status.msg);
 
 	/* the second status message that gets scheduled
 	 * - this time without callbacks for some reason 3.13 interuduced
@@ -566,10 +586,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				0);
 	priv->transfers->read_status2.read_status.cmd = MCP2515_CMD_STATUS;
 	priv->transfers->read_status2.read_status.t_tx.len = 1;
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->read_status2.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->read_status2.msg);
 
 	/* and the callback action transfer in all variants - we want to
 	 *  prepare the statements...
@@ -622,13 +639,10 @@ static int mcp2515a_init_transfers(struct net_device* net)
 					callback_action[i],
 					set_irq_mask,
 					MCP2515_REG_CANINTE);
-		data[0] = 0x3f; /* no MERRE, WAKIE */
+		data[0] = 0x1f; /* no MERRE, WAKIE */
 		/* and prepare the message */
-		if (use_optimize)
-			spi_message_optimize(spi,
-					&priv->transfers
-					->callback_action[i].msg,
-					GFP_KERNEL);
+		SPI_MESSAGE_OPTIMIZE(spi,
+				&priv->transfers->callback_action[i].msg);
 	}
 
 	/* setup TX2 */
@@ -647,10 +661,8 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	priv->transfers->transmit_tx2.transmit.cmd =
 		MCP2515_CMD_REQ2SEND((1<<2));
 	priv->transfers->transmit_tx2.transmit.t_tx.len = 1;
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->transmit_tx2.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx2.msg);
+
 	/* setup TX1 */
 	TRANSFER_INIT(priv->transfers,
 		transmit_tx1,
@@ -667,10 +679,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	priv->transfers->transmit_tx1.transmit.cmd =
 		MCP2515_CMD_REQ2SEND((1<<1));
 	priv->transfers->transmit_tx1.transmit.t_tx.len = 1;
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->transmit_tx1.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx1.msg);
 	/* setup TX0 */
 	TRANSFER_INIT(priv->transfers,
 		transmit_tx0,
@@ -687,10 +696,10 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	priv->transfers->transmit_tx0.transmit.cmd =
 		MCP2515_CMD_REQ2SEND((1<<0));
 	priv->transfers->transmit_tx0.transmit.t_tx.len = 1;
-	if (use_optimize)
-		spi_message_optimize(spi,
-				&priv->transfers->transmit_tx0.msg,
-				GFP_KERNEL);
+	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx0.msg);
+
+	/* TODO ERROR HANDLING of optimize and others */
+
 	/* and return ok */
 	return 0;
 }
@@ -893,9 +902,11 @@ static void mcp2515a_completed_read_status (void* context)
 	u8 eflg = trans->read_status.read_inte_intf_eflg.data[2];
 	/* structure to use*/
 	u8 structure = 0;
+	int ret=0;
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
+	set_low();
 	/* increment callback counter */
 	priv->status_callback_count++;
 	/* decide which structure we use */
@@ -907,13 +918,23 @@ static void mcp2515a_completed_read_status (void* context)
 		structure |= CALLBACK_READACK_RX1;
 	/* and enable our own interrupts before actually scheduling the
 	 * transfer - this is happening here avoiding a race condition... */
-	printk(KERN_INFO "XXXX %02x %02x %02x %08x\n",
+	if (0)	printk(KERN_INFO "XXXX %02x %02x %02x %08x\n",
 		status,eflg,structure,
 		trans->read_status.read_status.t_rx.rx_dma);
 	enable_irq(priv->spi->irq);
 
 	/* schedule the transfer */
-	spi_async(priv->spi,&trans->callback_action[structure].msg);
+	ret = spi_async(priv->spi,&trans->callback_action[structure].msg);
+	if (ret) {
+		/* disable interrupts again
+		 * to avoid that the system falls over
+		 * and croak abaout this fact */
+		disable_irq_nosync(priv->spi->irq);
+		netdev_err(net,"error scheduling spi messages with err=%i"
+			" - interrupts disabled\n",ret);
+		/* and shut down transmit */
+	}
+
 	/* and assign it for the callback */
 	priv->structure_used = structure;
 
@@ -932,6 +953,7 @@ static void mcp2515a_completed_read_status (void* context)
 
 	/* now handle the error situations - if such have occurred */
 	mcp2515a_completed_read_status_error(net);
+	set_high();
 }
 
 void mcp2515a_completed_transfers (void *context)
@@ -942,6 +964,11 @@ void mcp2515a_completed_transfers (void *context)
 	u8 structure = priv->structure_used;
 	/* get the status bits */
 	u8 status = trans->read_status.read_status.data[0];
+	set_low();
+	udelay(1);
+	set_high();
+	udelay(1);
+	set_low();
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
@@ -957,6 +984,7 @@ void mcp2515a_completed_transfers (void *context)
 			priv,
 			trans->callback_action[structure].readack_rx1.data);
 	}
+	set_high();
 }
 
 /* the interrupt-handler for this device */
@@ -966,14 +994,16 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
 	int err = 0;
-	printk(KERN_INFO "mcp2515-IRQ triggered\n");
+	set_low();
+	if (0)	printk(KERN_INFO "mcp2515-IRQ triggered\n");
 	/* we will just schedule the 2 status transfers (of which
 	 * the first generates a callback, while the second is just
 	 *  pending...) */
 	if (!priv->is_shutdown) {
 		err = spi_async(spi,&priv->transfers->read_status.msg);
+		set_high();
 		err = spi_async(spi,&priv->transfers->read_status2.msg);
-
+		set_low();
 		/* increment sent counter */
 		priv->status_sent_count++;
 	}
@@ -981,6 +1011,7 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 	/* disable the interrupt - one of the handlers will reenable it */
 	disable_irq_nosync(irq);
 
+	set_high();
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
@@ -1063,11 +1094,6 @@ static int mcp2515a_open(struct net_device *net)
 	//struct mcp251x_platform_data *pdata = spi->dev.platform_data;
         int ret;
 	int flags=0;
-
-	/* just in case identify the device again */
-        ret = mcp2515a_confirm_device(spi);
-        if (ret)
-                return ret;
 
 	/* try to open the can device */
         ret = open_candev(net);
@@ -1209,6 +1235,8 @@ static int mcp2515a_probe(struct spi_device *spi)
         ret = register_candev(net);
         if (ret)
 		goto error_transfers;
+
+	set_high();
 	/* return without errors */
 	return 0;
 
