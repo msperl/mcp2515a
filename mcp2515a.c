@@ -382,17 +382,17 @@ struct mcp2515a_transfers {
 		TRANSFER_READ_STRUCT(read_status,1);
 	} read_status2;
 	/* the message we send from the callback
-	 * - there are 8 variants of this*/
-#define CALLBACK_CLEAR       (1<<0)
-#define CALLBACK_ACK_RX0     (1<<1)
-#define CALLBACK_READACK_RX1 (1<<2)
+	 * - there are 8 variants of this */
+#define CALLBACK_CLEAR_OVERFLOW (1<<0)
+#define CALLBACK_ACK_RX0        (1<<1)
+#define CALLBACK_READACK_RX1    (1<<2)
 	struct {
 		struct spi_message msg;
-		/* clear overflow flags if needed */
+		/* clear overflow - if needed - CALLBACK_CLEAR_OVERFLOW */
 		TRANSFER_WRITE_STRUCT(clear_rxoverflow,2);
-		/* acknowledge RX0 - if we need it */
+		/* acknowledge RX0 - if needed - CALLBACK_ACK_RX0 */
 		TRANSFER_WRITE_STRUCT(ack_rx0,0);
-		/* read+acknowledge RX1 - if we need it */
+		/* read+ack RX1 - if needed - CALLBACK_READACK_RX1 */
 		TRANSFER_READ_STRUCT(readack_rx1,13);
 		/* and reenable interrupts by setting
 		 * the "corresponding" irq_mask */
@@ -520,8 +520,8 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				setconfig,
 				MCP2515_REG_CNF3);
 	data[0] = data[1] = data[2] = 0; /* CNF3,CNF2,CNF1 */
-	data[3] = 0xff; /* INTE - enable all interupt sources */
-	data[4] = 0; /* INTF - clear all interupt sources */
+	data[3] = 0x1f; /* INTE - enable all interupt sources */
+	data[4] = 0x00; /* INTF - clear all interupt sources */
 
 	/* and change to the final mode we want to enter */
 	data = TRANSFER_INIT_WRITE(priv->transfers,
@@ -598,7 +598,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 			callback_action[i],
 			mcp2515a_completed_transfers,net);
 		/* acknowledge the buffer overflows */
-		if (i & CALLBACK_CLEAR) {
+		if (i & CALLBACK_CLEAR_OVERFLOW) {
 			data = TRANSFER_INIT_WRITE(priv->transfers,
 						callback_action[i],
 						clear_rxoverflow,
@@ -911,7 +911,7 @@ static void mcp2515a_completed_read_status (void* context)
 	priv->status_callback_count++;
 	/* decide which structure we use */
 	if (eflg & (MCP2515_REG_EFLG_RX1OVR|MCP2515_REG_EFLG_RX0OVR))
-		structure |= CALLBACK_CLEAR;
+		structure |= CALLBACK_CLEAR_OVERFLOW;
 	if (status & MCP2515_CMD_STATUS_RX0IF )
 		structure |= CALLBACK_ACK_RX0;
 	if (status & MCP2515_CMD_STATUS_RX1IF )
@@ -961,14 +961,18 @@ void mcp2515a_completed_transfers (void *context)
 	struct net_device *net = context;
 	struct mcp2515a_priv *priv = netdev_priv(net);
 	struct mcp2515a_transfers *trans = priv->transfers;
-	u8 structure = priv->structure_used;
+	u8 structure;
 	/* get the status bits */
 	u8 status = trans->read_status.read_status.data[0];
 	set_low();
-	udelay(1);
-	set_high();
-	udelay(1);
-	set_low();
+	/* reset structure andexit if empty */
+	structure = priv->structure_used;
+	priv->structure_used = 0xff;
+	if (structure==0xff) {
+		printk(KERN_ERR "mcp2515a_completed_transfer: "
+			"unexpected callback\n");
+		return;
+	}
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
@@ -985,6 +989,7 @@ void mcp2515a_completed_transfers (void *context)
 			trans->callback_action[structure].readack_rx1.data);
 	}
 	set_high();
+
 }
 
 /* the interrupt-handler for this device */
@@ -995,7 +1000,6 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         struct spi_device *spi = priv->spi;
 	int err = 0;
 	set_low();
-	if (0)	printk(KERN_INFO "mcp2515-IRQ triggered\n");
 	/* we will just schedule the 2 status transfers (of which
 	 * the first generates a callback, while the second is just
 	 *  pending...) */
@@ -1091,7 +1095,6 @@ static int mcp2515a_open(struct net_device *net)
 {
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
-	//struct mcp251x_platform_data *pdata = spi->dev.platform_data;
         int ret;
 	int flags=0;
 
@@ -1100,22 +1103,10 @@ static int mcp2515a_open(struct net_device *net)
         if (ret)
                 return ret;
 
-	/* the interrupt flag calculation */
-/*
-	if (pdata->irq_flags)
-		flags = pdata->irq_flags;
-	else
-*/
-		/* this does not work for some reason o n the RPI:
-		 * flags |= IRQF_TRIGGER_LOW;
-		 * so we are having to "cope" with edge-interrupts,
-		 * which may bring other problems...
-		 */
-	flags = IRQF_TRIGGER_FALLING;
 	/* request the IRQ with the above flags */
         ret = request_irq(spi->irq,
 			mcp2515a_interrupt_handler,
-			flags,
+			IRQF_TRIGGER_FALLING,
 			net->name,
 			net);
         if (ret)
