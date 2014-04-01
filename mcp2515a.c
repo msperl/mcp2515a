@@ -229,8 +229,8 @@ struct mcp2515a_priv {
 	u8 carrier_off;
 	/* flag to say we are shutting down */
 	u8 is_shutdown;
-	/* flag to say we are in interrupt handler */
-	u8 in_irq;
+	/* a lock to avoid races scheduling multiple spi messages */
+	spinlock_t lock;
 };
 
 static const struct can_bittiming_const mcp2515a_bittiming_const = {
@@ -905,6 +905,8 @@ static void mcp2515a_completed_read_status (void* context)
 	/* structure to use*/
 	u8 structure = 0;
 	int ret=0;
+	unsigned long flags;
+
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
@@ -920,14 +922,13 @@ static void mcp2515a_completed_read_status (void* context)
 		structure |= CALLBACK_READACK_RX1;
 	/* and enable our own interrupts before actually scheduling the
 	 * transfer - this is happening here avoiding a race condition...
-	 * but we should not run this when in the irq handler itself...
-	 * why we get into this race is an open question.
 	 */
-	if (!priv->in_irq)
-		enable_irq(priv->spi->irq);
+	enable_irq(priv->spi->irq);
 
 	/* schedule the transfer */
+	spin_lock_irqsave(&priv->lock,flags);
 	ret = spi_async(priv->spi,&trans->callback_action[structure].msg);
+	spin_unlock_irqrestore(&priv->lock,flags);
 	if (ret) {
 		/* disable interrupts again
 		 * to avoid that the system falls over
@@ -972,7 +973,8 @@ void mcp2515a_completed_transfers (void *context)
 	structure = priv->structure_used;
 	priv->structure_used = 0xff;
 	if (structure==0xff) {
-		printk(KERN_ERR "mcp2515a_completed_transfer: "
+		dev_printk(KERN_ERR,&net->dev,
+			"mcp2515a_completed_transfer: "
 			"unexpected callback\n");
 		return;
 	}
@@ -1004,7 +1006,9 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 	int err = 0;
 	unsigned long flags;
 	set_low();
-	priv->in_irq=1;
+	/* disable the interrupt - one of the handlers will reenable it */
+	disable_irq_nosync(irq);
+
 	/* we will just schedule the 2 status transfers (of which
 	 * the first generates a callback, while the second is just
 	 *  pending...) */
@@ -1013,21 +1017,18 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 		 * between the 2 transfers - this is not an issue on
 		 * generic workqueue spi drivers, but it _can_ be an issue
 		 * when we are get interrupt by a DMA interrupt.
-		 * then reordering may occur
+		 * then reordering may occur which can be fatal
+		 * for the message scheduled via complete_read_status
 		 */
-		local_irq_save(flags);
+		spin_lock_irqsave(&priv->lock,flags);
 		err = spi_async(spi,&priv->transfers->read_status.msg);
 		err = spi_async(spi,&priv->transfers->read_status2.msg);
-		local_irq_restore(flags);
+		spin_unlock_irqrestore(&priv->lock,flags);
 		/* increment sent counter */
 		priv->status_sent_count++;
 	}
 
-	/* disable the interrupt - one of the handlers will reenable it */
-	disable_irq_nosync(irq);
-
 	set_high();
-	priv->in_irq=0;
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
@@ -1215,6 +1216,7 @@ static int mcp2515a_probe(struct spi_device *spi)
 	priv = netdev_priv(net);
 
 	/* fill in private data */
+	spin_lock_init(&priv->lock);
 	priv->spi = spi;
 	priv->net = net;
         priv->can.clock.freq = pdata->oscillator_frequency / 2;
