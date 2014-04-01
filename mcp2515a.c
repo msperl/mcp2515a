@@ -229,6 +229,8 @@ struct mcp2515a_priv {
 	u8 carrier_off;
 	/* flag to say we are shutting down */
 	u8 is_shutdown;
+	/* flag to say we are in interrupt handler */
+	u8 in_irq;
 };
 
 static const struct can_bittiming_const mcp2515a_bittiming_const = {
@@ -420,7 +422,7 @@ struct mcp2515a_transfers {
 static irqreturn_t mcp2515a_interrupt_handler(int, void *);
 static void mcp2515a_completed_read_status (void *);
 static void mcp2515a_completed_transfers (void *);
-static void mcp2515a_completed_dummy (void *data) { ; }
+/*static void mcp2515a_completed_dummy (void *data) { ; }*/
 
 static void mcp2515a_free_transfers(struct net_device* net)
 {
@@ -568,7 +570,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	 * the requirement for complete to be set - so some dummy code */
 	TRANSFER_INIT(priv->transfers,
 		read_status2,
-		mcp2515a_completed_dummy,
+		NULL /*mcp2515a_completed_dummy*/,
 		NULL);
 	/* we read the error-count */
 	data = TRANSFER_INIT_READ(priv->transfers,
@@ -648,7 +650,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* setup TX2 */
 	TRANSFER_INIT(priv->transfers,
 		transmit_tx2,
-		mcp2515a_completed_dummy,
+		NULL /*mcp2515a_completed_dummy*/,
 		NULL);
 	data = TRANSFER_INIT_WRITE(priv->transfers,
 				transmit_tx2,
@@ -666,7 +668,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* setup TX1 */
 	TRANSFER_INIT(priv->transfers,
 		transmit_tx1,
-		mcp2515a_completed_dummy,
+		NULL /*mcp2515a_completed_dummy*/,
 		NULL);
 	data = TRANSFER_INIT_WRITE(priv->transfers,
 				transmit_tx1,
@@ -683,7 +685,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* setup TX0 */
 	TRANSFER_INIT(priv->transfers,
 		transmit_tx0,
-		mcp2515a_completed_dummy,
+		NULL /*mcp2515a_completed_dummy*/,
 		NULL);
 	data = TRANSFER_INIT_WRITE(priv->transfers,
 				transmit_tx0,
@@ -917,11 +919,12 @@ static void mcp2515a_completed_read_status (void* context)
 	if (status & MCP2515_CMD_STATUS_RX1IF )
 		structure |= CALLBACK_READACK_RX1;
 	/* and enable our own interrupts before actually scheduling the
-	 * transfer - this is happening here avoiding a race condition... */
-	if (0)	printk(KERN_INFO "XXXX %02x %02x %02x %08x\n",
-		status,eflg,structure,
-		trans->read_status.read_status.t_rx.rx_dma);
-	enable_irq(priv->spi->irq);
+	 * transfer - this is happening here avoiding a race condition...
+	 * but we should not run this when in the irq handler itself...
+	 * why we get into this race is an open question.
+	 */
+	if (!priv->in_irq)
+		enable_irq(priv->spi->irq);
 
 	/* schedule the transfer */
 	ret = spi_async(priv->spi,&trans->callback_action[structure].msg);
@@ -999,15 +1002,23 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
 	int err = 0;
+	unsigned long flags;
 	set_low();
+	priv->in_irq=1;
 	/* we will just schedule the 2 status transfers (of which
 	 * the first generates a callback, while the second is just
 	 *  pending...) */
 	if (!priv->is_shutdown) {
+		/* here there is a potential race if we are interrupted
+		 * between the 2 transfers - this is not an issue on
+		 * generic workqueue spi drivers, but it _can_ be an issue
+		 * when we are get interrupt by a DMA interrupt.
+		 * then reordering may occur
+		 */
+		local_irq_save(flags);
 		err = spi_async(spi,&priv->transfers->read_status.msg);
-		set_high();
 		err = spi_async(spi,&priv->transfers->read_status2.msg);
-		set_low();
+		local_irq_restore(flags);
 		/* increment sent counter */
 		priv->status_sent_count++;
 	}
@@ -1016,6 +1027,7 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 	disable_irq_nosync(irq);
 
 	set_high();
+	priv->in_irq=0;
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
