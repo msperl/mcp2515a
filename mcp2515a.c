@@ -221,11 +221,10 @@ struct mcp2515a_priv {
 	volatile u32 status_callback_count;
 
 	/* the structures needed for TX */
-	struct completion can_transmit;
-	u8 mcp2515_status; /* the one from the mcp2515 */
-	u8 mcp2515_status_mask; /* extra status bits set while in flight */
-	u8 tx_priority;
+	bool tx_queue_stopped;
 	struct sk_buff *tx_skb[3];
+	s8 tx_next_priority;
+#define TX_PRIORITY_MAX 11
 
 	/* some states */
 	u8 carrier_off;
@@ -413,7 +412,6 @@ struct mcp2515a_transfers {
 		struct spi_message msg;
 		TRANSFER_READ_STRUCT(read_tec_rec,2);
 		TRANSFER_READ_STRUCT(read_rx0,13);
-		TRANSFER_READ_STRUCT(read_status,1);
 	} read_status2;
 	/* the message we send from the callback
 	 * - there are 8 variants of this */
@@ -602,12 +600,6 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				read_status2,
 				read_rx0,
 				MCP2515_REG_RXB0CTRL+1);
-	data = TRANSFER_INIT_READ(priv->transfers,
-				read_status2,
-				read_status,
-				0);
-	priv->transfers->read_status2.read_status.cmd = MCP2515_CMD_STATUS;
-	priv->transfers->read_status2.read_status.t_tx.len = 1;
 	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->read_status2.msg);
 
 	/* and the callback action transfer in all variants - we want to
@@ -721,7 +713,6 @@ static int mcp2515a_config(struct net_device *net)
 
 	/* execute transfer */
 	ret = spi_sync(spi,&priv->transfers->config.msg);
-	netdev_info(net, "called config: %i\n",ret);
 	if (ret)
 		return ret;
 	/* dump the CNF */
@@ -873,14 +864,48 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 }
 
 static inline void mcp2515a_completed_transmit(
-	struct net_device *net, struct sk_buff *skb)
+	struct net_device *net, struct mcp2515a_priv *priv, u8 tx)
 {
-	struct can_frame *frame = (struct can_frame *)skb->data;
+	struct sk_buff *skb;
+	struct can_frame *frame;
+	unsigned long flags;
+
+	spin_lock_irqsave(&priv->lock,flags);
+	/* get and clear SKB - free happens later */
+	skb = priv->tx_skb[tx];
+	priv->tx_skb[tx] = NULL;
+
+	/* wake tx-queue if stopped and if priority is positive */
+	if (priv->tx_queue_stopped) {
+		/* if all tx are empty, then clearrelease tx and reset prio */
+		if ((!priv->tx_skb[0])
+			&& (!priv->tx_skb[1])
+			&& (!priv->tx_skb[2])
+			) {
+			/* all empty, so we reset tx
+			   and start the queue */
+			priv->tx_queue_stopped = 0;
+			netif_wake_queue(net);
+			/* and we also reset priorities to max */
+			priv->tx_next_priority = TX_PRIORITY_MAX;
+		} else {
+			/* otherwise only wake up if priority>=0 */
+			if (priv->tx_next_priority >= 0) {
+				priv->tx_queue_stopped = 0;
+				netif_wake_queue(net);
+			}
+		}
+	}
+
 	/* increment counters */
 	net->stats.tx_packets++;
-	net->stats.tx_bytes += frame->can_dlc;
+	//frame = (struct can_frame *)skb->data;
+	//net->stats.tx_bytes += frame->can_dlc;
+
+	spin_unlock_irqrestore(&priv->lock,flags);
+
 	/* and release message */
-	dev_kfree_skb_irq(skb);
+	//dev_kfree_skb_irq(skb);
 }
 
 static void mcp2515a_completed_read_status (void* context)
@@ -902,8 +927,7 @@ static void mcp2515a_completed_read_status (void* context)
 	if (priv->is_shutdown)
 		return;
 	set_low();
-	/* increment callback counter */
-	priv->status_callback_count++;
+
 	/* decide which structure we use */
 
 	/* handle overflow */
@@ -921,42 +945,18 @@ static void mcp2515a_completed_read_status (void* context)
 		structure |= CALLBACK_READACK_RX1;
 
 	/* handle TX buffer interrupts */
-	if (status & MCP2515_CMD_STATUS_TX0IF) {
+	if (status & MCP2515_CMD_STATUS_TX2IF) {
 		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_TX0I;
-		mcp2515a_completed_transmit(net,priv->tx_skb[0]);
-		priv->tx_skb[0]=NULL;
+		clear_irq |= MCP2515_REG_CANINT_TX2I;
 	}
 	if (status & MCP2515_CMD_STATUS_TX1IF) {
 		structure |= CALLBACK_CLEAR_INT_FLAGS;
 		clear_irq |= MCP2515_REG_CANINT_TX1I;
-		mcp2515a_completed_transmit(net,priv->tx_skb[1]);
-		priv->tx_skb[1]=NULL;
 	}
-	if (status & MCP2515_CMD_STATUS_TX2IF) {
+	if (status & MCP2515_CMD_STATUS_TX0IF) {
 		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_TX2I;
-		mcp2515a_completed_transmit(net,priv->tx_skb[2]);
-		priv->tx_skb[2]=NULL;
+		clear_irq |= MCP2515_REG_CANINT_TX0I;
 	}
-
-	/* restart TX if all the buffers are empty */
-	spin_lock_irqsave(&priv->lock,flags);
-	if (! (status & (
-				MCP2515_CMD_STATUS_TX0REQ
-				| MCP2515_CMD_STATUS_TX1REQ
-				| MCP2515_CMD_STATUS_TX2REQ
-				))) {
-		if ( status & (
-				MCP2515_CMD_STATUS_TX0IF
-				| MCP2515_CMD_STATUS_TX1IF
-				| MCP2515_CMD_STATUS_TX2IF
-				)) {
-			netif_wake_queue(net);
-		}
-	}
-	spin_unlock_irqrestore(&priv->lock,flags);
-
 
 	/* now set the clear_irq bitmask */
 	trans->callback_action[structure].clear_irq.mask=clear_irq;
@@ -969,6 +969,7 @@ static void mcp2515a_completed_read_status (void* context)
 
 	/* schedule the transfer */
 	spin_lock_irqsave(&priv->lock,flags);
+	priv->structure_used = structure;
 	ret = spi_async(priv->spi,&trans->callback_action[structure].msg);
 	spin_unlock_irqrestore(&priv->lock,flags);
 	if (ret) {
@@ -981,24 +982,25 @@ static void mcp2515a_completed_read_status (void* context)
 		/* and shut down transmit */
 	}
 
-	/* and assign it for the callback */
-	priv->structure_used = structure;
-
-	/* copy status back to mcp2515_status */
-	priv->mcp2515_status = status & (
-		MCP2515_CMD_STATUS_TX0REQ
-		| MCP2515_CMD_STATUS_TX1REQ
-		| MCP2515_CMD_STATUS_TX2REQ);
-	/* and wake up if there are some bits NOT set */
-	if (priv->mcp2515_status ^ (
-			MCP2515_CMD_STATUS_TX0REQ
-			| MCP2515_CMD_STATUS_TX1REQ
-			| MCP2515_CMD_STATUS_TX2REQ)
-		)
-		complete(&priv->can_transmit);
-
 	/* now handle the error situations - if such have occurred */
 	mcp2515a_completed_read_status_error(net);
+
+	/* and mark the tx-messages as released
+	 * ( in the correct priority order )
+	 * we handle this only here, as we want to dispatch the spi message
+	 * as soon as possible
+	 */
+	if (status & MCP2515_CMD_STATUS_TX2IF) {
+		mcp2515a_completed_transmit(net,priv,2);
+	}
+	if (status & MCP2515_CMD_STATUS_TX1IF) {
+		mcp2515a_completed_transmit(net,priv,1);
+	}
+	if (status & MCP2515_CMD_STATUS_TX0IF) {
+		mcp2515a_completed_transmit(net,priv,0);
+	}
+
+
 	set_high();
 }
 
@@ -1080,8 +1082,8 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 {
 	struct mcp2515a_priv *priv = netdev_priv(net);
 	struct can_frame *frame = (struct can_frame *)skb->data;
-	int tx;
-	u8 prio;
+	int tx = -1;
+	u8 prio = -1;
 	u8 *buf;
 	unsigned long flags;
 	/* check some messages */
@@ -1091,18 +1093,19 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	 * * we make use of TX2 before TX1 and finally TX0.
 	 * * we also make use of decreasing priority configs
 	 * both means that we run the following sequence
-	 * * TX2-P3
-	 * * TX1-P3
-	 * * TX0-P3
-	 * * TX2-P2
-	 * * TX1-P2
-	 * * TX0-P2
-	 * * TX2-P1
-	 * * TX1-P1
-	 * * TX0-P1
-	 * * TX2-P0
-	 * * TX1-P0
-	 * * TX0-P0
+	 * * 11 - TX2-P3
+	 * * 10 - TX1-P3
+	 * *  9 - TX0-P3
+	 * *  8 - TX2-P2
+	 * *  7 - TX1-P2
+	 * *  6 - TX0-P2
+	 * *  5 - TX2-P1
+	 * *  4 - TX1-P1
+	 * *  3 - TX0-P1
+	 * *  2 - TX2-P0
+	 * *  1 - TX1-P0
+	 * *  0 - TX0-P0
+	 *
 	 * now we have to wait until the messages buffer TX0 has been
 	 * transmitted before we may continue.
 	 * this introduces a "delivery" latency every 12 packets where the
@@ -1128,43 +1131,31 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	 */
 	spin_lock_irqsave(&priv->lock,flags);
 
-	/* get priority to use for this tx */
-	prio = priv->tx_priority;
-	/* now decide which buffer we should use
-	 * BEWARE: possible races are lurking
+	/* if next priority is -1, then we have to wait for all TX to
+	 * clear, so stop the queue and return
 	 */
-	if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX2REQ)) {
-		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX2REQ ;
-		tx = 2;
-	} else if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX1REQ)) {
-		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX1REQ ;
-		tx = 1;
-	} else if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX0REQ)) {
-		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX0REQ ;
-		tx = 0;
-		/* decrement priority */
-		priv->tx_priority --;
-		if (priv->tx_priority ==-1) {
-			/* if we reached priority -1, then stall tx
-			 * the queue gets restarted by the interrupt handler
-			 * and tx_priority reaet to 3
-			 */
-			netif_stop_queue(net);
-			netdev_info(net,"stopped queue!");
-			/* and reset priority */
-			priv->tx_priority = 3;
-		}
-	} else {
-		/* if all are used, then stall the queue */
-		netif_stop_queue(net);
-		netdev_info(net,"stopped queue!");
-		/* decission has been mades, so unlock structure again */
-		spin_unlock_irqrestore(&priv->lock,flags);
-		return NETDEV_TX_BUSY;
-	}
-	/* and set the buffer */
+	if (priv->tx_next_priority < 0)
+		goto stop_queue;
+
+	/* check the channel */
+	tx = priv->tx_next_priority % 3;
+
+	/* get priority to use */
+	prio = (int)(priv->tx_next_priority / 3);
+
+	/* check if the tx channel is available
+	 * if not, then return with queue disabled
+	 */
+	if (priv->tx_skb[tx])
+		goto stop_queue;
+
+	/* otherwise we fill in the message - to get released in irq */
 	priv->tx_skb[tx] = skb;
-	/* decission has been mades, so unlock structure again */
+
+	/* calculate next priority */
+	priv->tx_next_priority--;
+
+	/* and release lock continuing the more "mundane" stuff */
 	spin_unlock_irqrestore(&priv->lock,flags);
 
 	/* so fill in that buffer */
@@ -1209,9 +1200,19 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
 
+	/* free the message */
+	kfree_skb(skb);
+
 	/* and return message as delivered */
 	return NETDEV_TX_OK;
 
+stop_queue:
+	/* stop queue */
+	priv->tx_queue_stopped = 1;
+	netif_stop_queue(net);
+	/* unlock and return BUSY */
+	spin_unlock_irqrestore(&priv->lock,flags);
+	return NETDEV_TX_BUSY;
 }
 
 static int mcp2515a_open(struct net_device *net)
@@ -1339,10 +1340,7 @@ static int mcp2515a_probe(struct spi_device *spi)
         priv->can.do_set_mode = mcp2515a_do_set_mode;
 
 	/* default TX-Priority */
-	priv->tx_priority=3;
-
-	/* initialize the "cancontroller" */
-	init_completion(&priv->can_transmit);
+	priv->tx_next_priority = TX_PRIORITY_MAX;
 
 	/* allocate some buffers from DMA space */
 	ret=mcp2515a_init_transfers(net);
