@@ -49,7 +49,8 @@ MODULE_PARM_DESC(use_optimize,
 		"Run the driver with spi_message_compile support");
 
 #ifdef SPI_HAVE_OPTIMIZE
-#define SPI_MESSAGE_OPTIMIZE(spi,message) if (use_optimize) spi_message_optimize(spi,message)
+#define SPI_MESSAGE_OPTIMIZE(spi,message)			\
+	if (use_optimize) spi_message_optimize(spi,message)
 #else
 #define SPI_MESSAGE_OPTIMIZE(spi,message)
 #endif
@@ -144,6 +145,7 @@ static void set_high(void) {
 #define MCP2515_REG_TXB0CTRL      0x30
 #define MCP2515_REG_TXB1CTRL      0x40
 #define MCP2515_REG_TXB2CTRL      0x50
+#define MCP2515_REG_TXBCTRL(i)    (MCP2515_REG_TXB0CTRL + i*16)
 
 #define MCP2515_REG_TXB_ABTF      (1<<6)
 #define MCP2515_REG_TXB_MLOA      (1<<5)
@@ -220,16 +222,22 @@ struct mcp2515a_priv {
 
 	/* the structures needed for TX */
 	struct completion can_transmit;
-	u8 tx_status; /* the one from the mcp2515 */
-	u8 tx_mask; /* the mask that transmits create temporarily while
-		       everything is in flight
-		       - we might need to lock this...*/
+	u8 mcp2515_status; /* the one from the mcp2515 */
+	u8 mcp2515_status_mask; /* extra status bits set while in flight */
+	u8 tx_priority;
+	struct sk_buff *tx_skb[3];
 
 	/* some states */
 	u8 carrier_off;
 	/* flag to say we are shutting down */
 	u8 is_shutdown;
-	/* a lock to avoid races scheduling multiple spi messages */
+
+	/* lock used to
+	 * protect structure
+	 * avoid races scheduling multiple spi messages in one go
+	 * (without the complete triggering BEFORE
+	 * the second message gets sent)
+	 */
 	spinlock_t lock;
 };
 
@@ -294,6 +302,12 @@ mcp2515a_confirm_device_err:
 	return -ENODEV;
 }
 
+#define TRANSFER_INIT(base,message,callback,callbackdata)		\
+	spi_message_init(&base->message.msg);				\
+	base->message.msg.is_dma_mapped = 1;				\
+	base->message.msg.complete = callback;				\
+	base->message.msg.context = callbackdata;
+
 #define TRANSFER_WRITE_STRUCT(name,datalen) \
 	struct { \
 		u8 cmd; \
@@ -301,11 +315,6 @@ mcp2515a_confirm_device_err:
 		u8 data[datalen]; \
 		struct spi_transfer t_tx;\
 	} name;
-#define TRANSFER_INIT(base,message,callback,callbackdata)		\
-	spi_message_init(&base->message.msg);				\
-	base->message.msg.is_dma_mapped = 1;				\
-	base->message.msg.complete = callback;				\
-	base->message.msg.context = callbackdata;
 #define TRANSFER_INIT_WRITE(base,message,xfer,regist)			\
 	base->message.xfer.data;					\
 	base->message.xfer.cmd = MCP2515_CMD_WRITE;			\
@@ -319,6 +328,29 @@ mcp2515a_confirm_device_err:
 	base->message.xfer.t_tx.rx_dma = 0;				\
 	base->message.xfer.t_tx.cs_change = 1;				\
 	spi_message_add_tail(&base->message.xfer.t_tx,&base->message.msg);
+
+#define TRANSFER_MODIFY_STRUCT(name) \
+	struct { \
+		u8 cmd; \
+		u8 reg; \
+		u8 mask; \
+		u8 value; \
+		struct spi_transfer t_modify;\
+	} name;
+#define TRANSFER_INIT_MODIFY(base,message,xfer,regist)			\
+	base->message.xfer.cmd = MCP2515_CMD_MODIFY;			\
+	base->message.xfer.reg = regist;				\
+	base->message.xfer.mask = 0;					\
+	base->message.xfer.value = 0;					\
+	base->message.xfer.t_modify.len = 4;				\
+	base->message.xfer.t_modify.tx_buf = &base->message.xfer.cmd;	\
+	base->message.xfer.t_modify.rx_buf = NULL;			\
+	base->message.xfer.t_modify.tx_dma = base##_dma_addr		\
+		+ offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
+	base->message.xfer.t_modify.rx_dma = 0;				\
+	base->message.xfer.t_modify.cs_change = 1;			\
+	spi_message_add_tail(&base->message.xfer.t_modify,&base->message.msg);
+
 #define TRANSFER_READ_STRUCT(name,datalen) \
 	struct { \
 		u8 cmd; \
@@ -385,37 +417,27 @@ struct mcp2515a_transfers {
 	} read_status2;
 	/* the message we send from the callback
 	 * - there are 8 variants of this */
-#define CALLBACK_CLEAR_OVERFLOW (1<<0)
-#define CALLBACK_ACK_RX0        (1<<1)
-#define CALLBACK_READACK_RX1    (1<<2)
+#define CALLBACK_CLEAR_ERR_FLAGS (1<<0)
+#define CALLBACK_CLEAR_INT_FLAGS (1<<1)
+#define CALLBACK_READACK_RX1     (1<<2)
+#define CALLBACK_SIZE            8
 	struct {
 		struct spi_message msg;
-		/* clear overflow - if needed - CALLBACK_CLEAR_OVERFLOW */
-		TRANSFER_WRITE_STRUCT(clear_rxoverflow,2);
-		/* acknowledge RX0 - if needed - CALLBACK_ACK_RX0 */
-		TRANSFER_WRITE_STRUCT(ack_rx0,0);
+		/* clear error flags - if needed - CALLBACK_CLEAR_ERR_FLAGS */
+		TRANSFER_MODIFY_STRUCT(clear_err);
+		/* clear irq flags - if needed - CALLBACK_CLEAR_IRQ_FLAGS */
+		TRANSFER_MODIFY_STRUCT(clear_irq);
 		/* read+ack RX1 - if needed - CALLBACK_READACK_RX1 */
 		TRANSFER_READ_STRUCT(readack_rx1,13);
-		/* and reenable interrupts by setting
-		 * the "corresponding" irq_mask */
+		/* the "corresponding" irq_mask */
 		TRANSFER_WRITE_STRUCT(set_irq_mask,1);
-	} callback_action[8];
+	} callback_action[CALLBACK_SIZE];
 	/* the transfers */
 	struct {
 		struct spi_message msg;
 		TRANSFER_WRITE_STRUCT(message,14);
 		TRANSFER_WRITE_STRUCT(transmit,0);
-	} transmit_tx2;
-	struct {
-		struct spi_message msg;
-		TRANSFER_WRITE_STRUCT(message,14);
-		TRANSFER_WRITE_STRUCT(transmit,0);
-	} transmit_tx1;
-	struct {
-		struct spi_message msg;
-		TRANSFER_WRITE_STRUCT(message,14);
-		TRANSFER_WRITE_STRUCT(transmit,0);
-	} transmit_tx0;
+	} transmit_tx[3];
 };
 
 /* the complete callbacks and interrupt handlers */
@@ -434,22 +456,21 @@ static void mcp2515a_free_transfers(struct net_device* net)
 		/* first unprepare messages */
 #ifdef SPI_HAVE_OPTIMIZE
 		printk(KERN_INFO "Unoptimize config\n");
-		spi_message_unoptimize(&priv->transfers->config.msg);
+		//spi_message_unoptimize(&priv->transfers->config.msg);
 		printk(KERN_INFO "Unoptimize status\n");
 		spi_message_unoptimize(&priv->transfers->read_status.msg);
 		printk(KERN_INFO "Unoptimize status2\n");
 		spi_message_unoptimize(&priv->transfers->read_status2.msg);
-		for( i=0 ; i<8 ; i++) {
+		for(i = 0; i < CALLBACK_SIZE; i++) {
 			printk(KERN_INFO "Unoptimize callback_action %i\n",i);
 			spi_message_unoptimize(
 				&priv->transfers->callback_action[i].msg);
 		}
-		printk(KERN_INFO "Unoptimize tx2\n");
-		spi_message_unoptimize(&priv->transfers->transmit_tx2.msg);
-		printk(KERN_INFO "Unoptimize tx1\n");
-		spi_message_unoptimize(&priv->transfers->transmit_tx1.msg);
-		printk(KERN_INFO "Unoptimize tx0\n");
-		spi_message_unoptimize(&priv->transfers->transmit_tx0.msg);
+		for(i = 0; i < 3; i++) {
+			printk(KERN_INFO "Unoptimize tx%i\n",i);
+			spi_message_unoptimize(
+				&priv->transfers->transmit_tx[i].msg);
+		}
 #endif
 		/* now release the structures */
 		dma_free_coherent(&priv->spi->dev,
@@ -537,7 +558,6 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				config,
 				readconfig,
 				MCP2515_REG_CNF3);
-	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->config.msg);
 
 	/* The read status transfer with the callback */
 	TRANSFER_INIT(priv->transfers,
@@ -570,7 +590,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	 * the requirement for complete to be set - so some dummy code */
 	TRANSFER_INIT(priv->transfers,
 		read_status2,
-		NULL /*mcp2515a_completed_dummy*/,
+		NULL,
 		NULL);
 	/* we read the error-count */
 	data = TRANSFER_INIT_READ(priv->transfers,
@@ -595,34 +615,23 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	 * note that we will need to change the order in which we run
 	 * this dependent on status flags from above
 	 */
-	for ( i=0 ; i<8; i++) {
+	for ( i=0 ; i<CALLBACK_SIZE; i++) {
 		TRANSFER_INIT(priv->transfers,
 			callback_action[i],
 			mcp2515a_completed_transfers,net);
 		/* acknowledge the buffer overflows */
-		if (i & CALLBACK_CLEAR_OVERFLOW) {
-			data = TRANSFER_INIT_WRITE(priv->transfers,
+		if (i & CALLBACK_CLEAR_INT_FLAGS) {
+			TRANSFER_INIT_MODIFY(priv->transfers,
 						callback_action[i],
-						clear_rxoverflow,
-						MCP2515_REG_EFLG);
-			priv->transfers
-				->callback_action[i].clear_rxoverflow.cmd =
-				MCP2515_CMD_MODIFY;
-			data[0] = MCP2515_REG_EFLG_RX1OVR
-				| MCP2515_REG_EFLG_RX0OVR;
-			data[1] = 0;
+						clear_irq,
+						MCP2515_REG_CANINTF);
 		}
-		/* acknowledge the RX0 buffer */
-		if (i & CALLBACK_ACK_RX0) {
-			data = TRANSFER_INIT_WRITE(priv->transfers,
-						callback_action[i],
-						ack_rx0,
-						0);
-			priv->transfers
-				->callback_action[i].ack_rx0.cmd =
-				MCP2515_CMD_READ_RX(0);
-			priv->transfers
-				->callback_action[i].ack_rx0.t_tx.len = 1;
+		/* acknowledge the buffer overflows */
+		if (i & CALLBACK_CLEAR_ERR_FLAGS) {
+			TRANSFER_INIT_MODIFY(priv->transfers,
+					callback_action[i],
+					clear_err,
+					MCP2515_REG_EFLG);
 		}
 		/* read and acknowledge rx1 */
 		if (i & CALLBACK_READACK_RX1) {
@@ -647,59 +656,27 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				&priv->transfers->callback_action[i].msg);
 	}
 
-	/* setup TX2 */
-	TRANSFER_INIT(priv->transfers,
-		transmit_tx2,
-		NULL /*mcp2515a_completed_dummy*/,
-		NULL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx2,
-				message,
-				MCP2515_REG_TXB2CTRL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx2,
-				transmit,
-				0);
-	priv->transfers->transmit_tx2.transmit.cmd =
-		MCP2515_CMD_REQ2SEND((1<<2));
-	priv->transfers->transmit_tx2.transmit.t_tx.len = 1;
-	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx2.msg);
+	/* setup TX0,1,2 */
+	for ( i=0 ; i<3; i++) {
 
-	/* setup TX1 */
-	TRANSFER_INIT(priv->transfers,
-		transmit_tx1,
-		NULL /*mcp2515a_completed_dummy*/,
-		NULL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx1,
-				message,
-				MCP2515_REG_TXB2CTRL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx1,
-				transmit,
-				0);
-	priv->transfers->transmit_tx1.transmit.cmd =
-		MCP2515_CMD_REQ2SEND((1<<1));
-	priv->transfers->transmit_tx1.transmit.t_tx.len = 1;
-	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx1.msg);
-	/* setup TX0 */
-	TRANSFER_INIT(priv->transfers,
-		transmit_tx0,
-		NULL /*mcp2515a_completed_dummy*/,
-		NULL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx0,
-				message,
-				MCP2515_REG_TXB2CTRL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				transmit_tx0,
-				transmit,
-				0);
-	priv->transfers->transmit_tx0.transmit.cmd =
-		MCP2515_CMD_REQ2SEND((1<<0));
-	priv->transfers->transmit_tx0.transmit.t_tx.len = 1;
-	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->transmit_tx0.msg);
-
+		TRANSFER_INIT(priv->transfers,
+			transmit_tx[i],
+			NULL,
+			NULL);
+		data = TRANSFER_INIT_WRITE(priv->transfers,
+				transmit_tx[i],
+					message,
+					MCP2515_REG_TXBCTRL(i));
+		data = TRANSFER_INIT_WRITE(priv->transfers,
+					transmit_tx[i],
+					transmit,
+					0 /* not needed */);
+		priv->transfers->transmit_tx[i].transmit.cmd =
+			MCP2515_CMD_REQ2SEND((1<<i));
+		priv->transfers->transmit_tx[i].transmit.t_tx.len = 1;
+		SPI_MESSAGE_OPTIMIZE(
+			spi,&priv->transfers->transmit_tx[i].msg);
+	}
 	/* TODO ERROR HANDLING of optimize and others */
 
 	/* and return ok */
@@ -744,6 +721,7 @@ static int mcp2515a_config(struct net_device *net)
 
 	/* execute transfer */
 	ret = spi_sync(spi,&priv->transfers->config.msg);
+	netdev_info(net, "called config: %i\n",ret);
 	if (ret)
 		return ret;
 	/* dump the CNF */
@@ -894,6 +872,17 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 	}
 }
 
+static inline void mcp2515a_completed_transmit(
+	struct net_device *net, struct sk_buff *skb)
+{
+	struct can_frame *frame = (struct can_frame *)skb->data;
+	/* increment counters */
+	net->stats.tx_packets++;
+	net->stats.tx_bytes += frame->can_dlc;
+	/* and release message */
+	dev_kfree_skb_irq(skb);
+}
+
 static void mcp2515a_completed_read_status (void* context)
 {
 	struct net_device *net = context;
@@ -904,6 +893,8 @@ static void mcp2515a_completed_read_status (void* context)
 	u8 eflg = trans->read_status.read_inte_intf_eflg.data[2];
 	/* structure to use*/
 	u8 structure = 0;
+	u8 clear_irq = 0;
+	u8 clear_err = 0;
 	int ret=0;
 	unsigned long flags;
 
@@ -914,12 +905,63 @@ static void mcp2515a_completed_read_status (void* context)
 	/* increment callback counter */
 	priv->status_callback_count++;
 	/* decide which structure we use */
-	if (eflg & (MCP2515_REG_EFLG_RX1OVR|MCP2515_REG_EFLG_RX0OVR))
-		structure |= CALLBACK_CLEAR_OVERFLOW;
-	if (status & MCP2515_CMD_STATUS_RX0IF )
-		structure |= CALLBACK_ACK_RX0;
+
+	/* handle overflow */
+	if (eflg & (MCP2515_REG_EFLG_RX1OVR|MCP2515_REG_EFLG_RX0OVR)) {
+		structure |= CALLBACK_CLEAR_ERR_FLAGS;
+		clear_err = MCP2515_REG_EFLG_RX1OVR
+			| MCP2515_REG_EFLG_RX0OVR;
+	}
+	/* handle RX buffers */
+	if (status & MCP2515_CMD_STATUS_RX0IF ) {
+		structure |= CALLBACK_CLEAR_INT_FLAGS;
+		clear_irq |= MCP2515_REG_CANINT_RX0I;
+	}
 	if (status & MCP2515_CMD_STATUS_RX1IF )
 		structure |= CALLBACK_READACK_RX1;
+
+	/* handle TX buffer interrupts */
+	if (status & MCP2515_CMD_STATUS_TX0IF) {
+		structure |= CALLBACK_CLEAR_INT_FLAGS;
+		clear_irq |= MCP2515_REG_CANINT_TX0I;
+		mcp2515a_completed_transmit(net,priv->tx_skb[0]);
+		priv->tx_skb[0]=NULL;
+	}
+	if (status & MCP2515_CMD_STATUS_TX1IF) {
+		structure |= CALLBACK_CLEAR_INT_FLAGS;
+		clear_irq |= MCP2515_REG_CANINT_TX1I;
+		mcp2515a_completed_transmit(net,priv->tx_skb[1]);
+		priv->tx_skb[1]=NULL;
+	}
+	if (status & MCP2515_CMD_STATUS_TX2IF) {
+		structure |= CALLBACK_CLEAR_INT_FLAGS;
+		clear_irq |= MCP2515_REG_CANINT_TX2I;
+		mcp2515a_completed_transmit(net,priv->tx_skb[2]);
+		priv->tx_skb[2]=NULL;
+	}
+
+	/* restart TX if all the buffers are empty */
+	spin_lock_irqsave(&priv->lock,flags);
+	if (! (status & (
+				MCP2515_CMD_STATUS_TX0REQ
+				| MCP2515_CMD_STATUS_TX1REQ
+				| MCP2515_CMD_STATUS_TX2REQ
+				))) {
+		if ( status & (
+				MCP2515_CMD_STATUS_TX0IF
+				| MCP2515_CMD_STATUS_TX1IF
+				| MCP2515_CMD_STATUS_TX2IF
+				)) {
+			netif_wake_queue(net);
+		}
+	}
+	spin_unlock_irqrestore(&priv->lock,flags);
+
+
+	/* now set the clear_irq bitmask */
+	trans->callback_action[structure].clear_irq.mask=clear_irq;
+	trans->callback_action[structure].clear_err.mask=clear_err;
+
 	/* and enable our own interrupts before actually scheduling the
 	 * transfer - this is happening here avoiding a race condition...
 	 */
@@ -942,13 +984,13 @@ static void mcp2515a_completed_read_status (void* context)
 	/* and assign it for the callback */
 	priv->structure_used = structure;
 
-	/* copy status back to tx_status */
-	priv->tx_status = status & (
+	/* copy status back to mcp2515_status */
+	priv->mcp2515_status = status & (
 		MCP2515_CMD_STATUS_TX0REQ
 		| MCP2515_CMD_STATUS_TX1REQ
 		| MCP2515_CMD_STATUS_TX2REQ);
 	/* and wake up if there are some bits NOT set */
-	if (priv->tx_status ^ (
+	if (priv->mcp2515_status ^ (
 			MCP2515_CMD_STATUS_TX0REQ
 			| MCP2515_CMD_STATUS_TX1REQ
 			| MCP2515_CMD_STATUS_TX2REQ)
@@ -1036,6 +1078,12 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 				struct net_device *net)
 {
+	struct mcp2515a_priv *priv = netdev_priv(net);
+	struct can_frame *frame = (struct can_frame *)skb->data;
+	int tx;
+	u8 prio;
+	u8 *buf;
+	unsigned long flags;
 	/* check some messages */
         if (can_dropped_invalid_skb(net, skb))
                 return NETDEV_TX_OK;
@@ -1078,30 +1126,92 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	 * DMA is reading the next status now - so this can result in a
 	 * buffer overwritten - how to resolve tht is a good question
 	 */
-#if 1
-	return NETDEV_TX_BUSY;
-#else
-	if (!try_wait_for_completion(&priv->can_transfer))
-		return NETDEV_TX_BUSY;
+	spin_lock_irqsave(&priv->lock,flags);
 
-	/* first check on priority reset back to 3 */
-	if (priv->tx_status == 0)
-		priv->tx_priority = 3;
-
-	/* now decide which buffer we should use */
-	if (!(priv->tx_status&MCP2515_CMD_STATUS_TX2REQ)) {
+	/* get priority to use for this tx */
+	prio = priv->tx_priority;
+	/* now decide which buffer we should use
+	 * BEWARE: possible races are lurking
+	 */
+	if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX2REQ)) {
+		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX2REQ ;
 		tx = 2;
-	} else if (!(priv->tx_status&MCP2515_CMD_STATUS_TX1REQ)) {
+	} else if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX1REQ)) {
+		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX1REQ ;
 		tx = 1;
-	} else if (!(priv->tx_status&MCP2515_CMD_STATUS_TX0REQ)) {
+	} else if (!(priv->mcp2515_status & MCP2515_CMD_STATUS_TX0REQ)) {
+		priv->mcp2515_status |= MCP2515_CMD_STATUS_TX0REQ ;
 		tx = 0;
+		/* decrement priority */
+		priv->tx_priority --;
+		if (priv->tx_priority ==-1) {
+			/* if we reached priority -1, then stall tx
+			 * the queue gets restarted by the interrupt handler
+			 * and tx_priority reaet to 3
+			 */
+			netif_stop_queue(net);
+			netdev_info(net,"stopped queue!");
+			/* and reset priority */
+			priv->tx_priority = 3;
+		}
+	} else {
+		/* if all are used, then stall the queue */
+		netif_stop_queue(net);
+		netdev_info(net,"stopped queue!");
+		/* decission has been mades, so unlock structure again */
+		spin_unlock_irqrestore(&priv->lock,flags);
+		return NETDEV_TX_BUSY;
 	}
-	/* so fill in that buffer*/
-	/* transfer and forget it */
+	/* and set the buffer */
+	priv->tx_skb[tx] = skb;
+	/* decission has been mades, so unlock structure again */
+	spin_unlock_irqrestore(&priv->lock,flags);
+
+	/* so fill in that buffer */
+	buf = priv->transfers->transmit_tx[tx].message.data;
+	/* set the TX priority */
+	buf[0] = prio;
+
+	/* transform the CAN message ID */
+        if (frame->can_id & CAN_EFF_FLAG) {
+                buf[1] = frame->can_id >> 21;
+                buf[2] = (frame->can_id >> 13 & 0xe0) | 8 |
+                        (frame->can_id >> 16 & 3);
+                buf[3] = frame->can_id >> 8;
+                buf[4] = frame->can_id;
+        } else {
+                buf[1] = frame->can_id >> 3;
+                buf[2] = frame->can_id << 5;
+                buf[3] = 0;
+                buf[4] = 0;
+        }
+	/* set ID length */
+        if (frame->can_id & CAN_RTR_FLAG)
+                buf[5] = frame->can_dlc | 0x40;
+        else
+                buf[5] = frame->can_dlc;
+
+	/* and copy the payload */
+        memcpy(buf + 6, frame->data, frame->can_dlc);
+
+	/* set length only if we optimize and support vary */
+#ifdef SPI_HAVE_OPTIMIZE
+	if (
+		(priv->transfers->transmit_tx[tx].msg.is_optimized)
+		&&
+		(priv->transfers->transmit_tx[tx].message.t_tx.vary
+			& SPI_OPTIMIZE_VARY_LENGTH)
+		)
+#endif
+		priv->transfers->transmit_tx[tx].message.t_tx.len =
+			2 + 5 + frame->can_dlc;
+
+	/* transfer and forget */
+	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
 
 	/* and return message as delivered */
 	return NETDEV_TX_OK;
-#endif
+
 }
 
 static int mcp2515a_open(struct net_device *net)
@@ -1227,6 +1337,9 @@ static int mcp2515a_probe(struct spi_device *spi)
 		| CAN_CTRLMODE_LISTENONLY
 		| CAN_CTRLMODE_ONE_SHOT ;
         priv->can.do_set_mode = mcp2515a_do_set_mode;
+
+	/* default TX-Priority */
+	priv->tx_priority=3;
 
 	/* initialize the "cancontroller" */
 	init_completion(&priv->can_transmit);
