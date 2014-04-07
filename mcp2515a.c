@@ -222,7 +222,7 @@ struct mcp2515a_priv {
 
 	/* the structures needed for TX */
 	bool tx_queue_stopped;
-	struct sk_buff *tx_skb[3];
+	u8 tx_len[3];
 	s8 tx_next_priority;
 #define TX_PRIORITY_MAX 11
 
@@ -866,21 +866,20 @@ static void mcp2515a_completed_read_status_error (struct net_device *net)
 static inline void mcp2515a_completed_transmit(
 	struct net_device *net, struct mcp2515a_priv *priv, u8 tx)
 {
-	struct sk_buff *skb;
-	struct can_frame *frame;
+	u8 len;
 	unsigned long flags;
 
 	spin_lock_irqsave(&priv->lock,flags);
 	/* get and clear SKB - free happens later */
-	skb = priv->tx_skb[tx];
-	priv->tx_skb[tx] = NULL;
+	len = priv->tx_len[tx];
+	priv->tx_len[tx] = 0;
 
 	/* wake tx-queue if stopped and if priority is positive */
 	if (priv->tx_queue_stopped) {
 		/* if all tx are empty, then clearrelease tx and reset prio */
-		if ((!priv->tx_skb[0])
-			&& (!priv->tx_skb[1])
-			&& (!priv->tx_skb[2])
+		if ((priv->tx_len[0] == 0)
+			&& (priv->tx_len[1] == 0)
+			&& (priv->tx_len[2] == 0)
 			) {
 			/* all empty, so we reset tx
 			   and start the queue */
@@ -899,13 +898,9 @@ static inline void mcp2515a_completed_transmit(
 
 	/* increment counters */
 	net->stats.tx_packets++;
-	//frame = (struct can_frame *)skb->data;
-	//net->stats.tx_bytes += frame->can_dlc;
+	net->stats.tx_bytes += len & 0x7f;
 
 	spin_unlock_irqrestore(&priv->lock,flags);
-
-	/* and release message */
-	//dev_kfree_skb_irq(skb);
 }
 
 static void mcp2515a_completed_read_status (void* context)
@@ -1089,6 +1084,7 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	/* check some messages */
         if (can_dropped_invalid_skb(net, skb))
                 return NETDEV_TX_OK;
+
 	/* scheduling is as simple as this:
 	 * * we make use of TX2 before TX1 and finally TX0.
 	 * * we also make use of decreasing priority configs
@@ -1146,14 +1142,20 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	/* check if the tx channel is available
 	 * if not, then return with queue disabled
 	 */
-	if (priv->tx_skb[tx])
+	if (priv->tx_len[tx])
 		goto stop_queue;
 
 	/* otherwise we fill in the message - to get released in irq */
-	priv->tx_skb[tx] = skb;
+	priv->tx_len[tx] = 0x80 + frame->can_dlc;
 
 	/* calculate next priority */
 	priv->tx_next_priority--;
+
+	/* if priority is now -1, then stop queue */
+	if (priv->tx_next_priority < 0) {
+		priv->tx_queue_stopped = 1;
+		netif_stop_queue(net);
+	}
 
 	/* and release lock continuing the more "mundane" stuff */
 	spin_unlock_irqrestore(&priv->lock,flags);
@@ -1199,9 +1201,6 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
-
-	/* free the message */
-	kfree_skb(skb);
 
 	/* and return message as delivered */
 	return NETDEV_TX_OK;
@@ -1325,6 +1324,7 @@ static int mcp2515a_probe(struct spi_device *spi)
 
 	/* get the private data and fill in details */
 	priv = netdev_priv(net);
+	memset(priv,0,sizeof(*priv));
 
 	/* fill in private data */
 	spin_lock_init(&priv->lock);
