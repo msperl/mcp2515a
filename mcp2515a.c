@@ -447,14 +447,11 @@ static void mcp2515a_completed_transfers (void *);
 static void mcp2515a_free_transfers(struct net_device* net)
 {
 	struct mcp2515a_priv *priv = netdev_priv(net);
-        //struct spi_device *spi = priv->spi;
 	int i;
 	/* if we have been prepared, then release us */
 	if (priv->transfers) {
 		/* first unprepare messages */
 #ifdef SPI_HAVE_OPTIMIZE
-		printk(KERN_INFO "Unoptimize config\n");
-		//spi_message_unoptimize(&priv->transfers->config.msg);
 		printk(KERN_INFO "Unoptimize status\n");
 		spi_message_unoptimize(&priv->transfers->read_status.msg);
 		printk(KERN_INFO "Unoptimize status2\n");
@@ -874,25 +871,21 @@ static inline void mcp2515a_completed_transmit(
 	len = priv->tx_len[tx];
 	priv->tx_len[tx] = 0;
 
+	/* if all tx are empty, then reset priority */
+	if ((priv->tx_len[0] == 0)
+		&& (priv->tx_len[1] == 0)
+		&& (priv->tx_len[2] == 0)
+		) {
+		/* reset priorities to max */
+		priv->tx_next_priority = TX_PRIORITY_MAX;
+	}
+
 	/* wake tx-queue if stopped and if priority is positive */
 	if (priv->tx_queue_stopped) {
-		/* if all tx are empty, then clearrelease tx and reset prio */
-		if ((priv->tx_len[0] == 0)
-			&& (priv->tx_len[1] == 0)
-			&& (priv->tx_len[2] == 0)
-			) {
-			/* all empty, so we reset tx
-			   and start the queue */
+		/* wake if priority >=0 */
+		if (priv->tx_next_priority >= 0) {
 			priv->tx_queue_stopped = 0;
 			netif_wake_queue(net);
-			/* and we also reset priorities to max */
-			priv->tx_next_priority = TX_PRIORITY_MAX;
-		} else {
-			/* otherwise only wake up if priority>=0 */
-			if (priv->tx_next_priority >= 0) {
-				priv->tx_queue_stopped = 0;
-				netif_wake_queue(net);
-			}
 		}
 	}
 
@@ -900,6 +893,7 @@ static inline void mcp2515a_completed_transmit(
 	net->stats.tx_packets++;
 	net->stats.tx_bytes += len & 0x7f;
 
+	/* return unlocked */
 	spin_unlock_irqrestore(&priv->lock,flags);
 }
 
@@ -921,7 +915,6 @@ static void mcp2515a_completed_read_status (void* context)
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
-	set_low();
 
 	/* decide which structure we use */
 
@@ -994,9 +987,6 @@ static void mcp2515a_completed_read_status (void* context)
 	if (status & MCP2515_CMD_STATUS_TX0IF) {
 		mcp2515a_completed_transmit(net,priv,0);
 	}
-
-
-	set_high();
 }
 
 void mcp2515a_completed_transfers (void *context)
@@ -1007,7 +997,7 @@ void mcp2515a_completed_transfers (void *context)
 	u8 structure;
 	/* get the status bits */
 	u8 status = trans->read_status.read_status.data[0];
-	set_low();
+
 	/* reset structure andexit if empty */
 	structure = priv->structure_used;
 	priv->structure_used = 0xff;
@@ -1032,8 +1022,6 @@ void mcp2515a_completed_transfers (void *context)
 			priv,
 			trans->callback_action[structure].readack_rx1.data);
 	}
-	set_high();
-
 }
 
 /* the interrupt-handler for this device */
@@ -1044,7 +1032,7 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
         struct spi_device *spi = priv->spi;
 	int err = 0;
 	unsigned long flags;
-	set_low();
+
 	/* disable the interrupt - one of the handlers will reenable it */
 	disable_irq_nosync(irq);
 
@@ -1067,7 +1055,6 @@ static irqreturn_t mcp2515a_interrupt_handler(int irq, void *dev_id)
 		priv->status_sent_count++;
 	}
 
-	set_high();
 	/* return with a andled interrupt */
         return IRQ_HANDLED;
 }
@@ -1081,6 +1068,8 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	u8 prio = -1;
 	u8 *buf;
 	unsigned long flags;
+
+
 	/* check some messages */
         if (can_dropped_invalid_skb(net, skb))
                 return NETDEV_TX_OK;
@@ -1115,17 +1104,28 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	 * a module parameter to ignore these delays and schedule
 	 * immediately...
 	 *
-	 * for most practical purposes we will just schedule the message
-	 * directly via SPI and if we have to wait, then we will delay the
-	 * transfer
-	 */
-
-	/* the other thing is that we have the oportunity for
-	 * race-conditions... a message might be in "transfer" while the
-	 * DMA is reading the next status now - so this can result in a
-	 * buffer overwritten - how to resolve tht is a good question
+	 * measured delay is 22us between 2 messages on the CAN bus
+	 * but for the step from p0 to P11 the delay is about 104us.
+	 * that is on a RPI (with 8MHz SPI Bus speed).
+	 *
+	 * part comes from the fact that the IRQ handler is scheduling
+	 * the "normal" parts first and only then the messages data can
+	 * get scheduled and transmitted
+	 *
+	 * possibly this can get reduce by changing the code to schedule
+	 * a pending TX message first, but that may complicate things
+	 * especially RX buffer overflows becomes more liklely...
+	 *
+	 * the other observation is that we still use too many interrupts
+	 * possibly we could handle more transfers together and only trigger
+	 * an irq on every second message - would half the interrupts by 2.
+	 * the question is: is it worth the effort and complexity ?
 	 */
 	spin_lock_irqsave(&priv->lock,flags);
+
+	/* if we are stopped then return busy */
+	if (priv->tx_queue_stopped)
+		goto return_busy;
 
 	/* if next priority is -1, then we have to wait for all TX to
 	 * clear, so stop the queue and return
@@ -1202,6 +1202,9 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
 
+	/* forget skb */
+	kfree_skb(skb);
+
 	/* and return message as delivered */
 	return NETDEV_TX_OK;
 
@@ -1209,7 +1212,9 @@ stop_queue:
 	/* stop queue */
 	priv->tx_queue_stopped = 1;
 	netif_stop_queue(net);
+
 	/* unlock and return BUSY */
+return_busy:
 	spin_unlock_irqrestore(&priv->lock,flags);
 	return NETDEV_TX_BUSY;
 }
@@ -1352,7 +1357,6 @@ static int mcp2515a_probe(struct spi_device *spi)
         if (ret)
 		goto error_transfers;
 
-	set_high();
 	/* return without errors */
 	return 0;
 
