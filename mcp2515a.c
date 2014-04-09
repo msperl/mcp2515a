@@ -415,16 +415,16 @@ struct mcp2515a_transfers {
 	} read_status2;
 	/* the message we send from the callback
 	 * - there are 8 variants of this */
-#define CALLBACK_CLEAR_ERR_FLAGS (1<<0)
-#define CALLBACK_CLEAR_INT_FLAGS (1<<1)
-#define CALLBACK_READACK_RX1     (1<<2)
-#define CALLBACK_SIZE            8
+#define CALLBACK_CLEAR_EFLG  (1<<0)
+#define CALLBACK_CLEAR_INTF  (1<<1)
+#define CALLBACK_READACK_RX1 (1<<2)
+#define CALLBACK_SIZE        8
 	struct {
 		struct spi_message msg;
 		/* clear error flags - if needed - CALLBACK_CLEAR_ERR_FLAGS */
-		TRANSFER_MODIFY_STRUCT(clear_err);
+		TRANSFER_MODIFY_STRUCT(clear_eflg);
 		/* clear irq flags - if needed - CALLBACK_CLEAR_IRQ_FLAGS */
-		TRANSFER_MODIFY_STRUCT(clear_irq);
+		TRANSFER_MODIFY_STRUCT(clear_intf);
 		/* read+ack RX1 - if needed - CALLBACK_READACK_RX1 */
 		TRANSFER_READ_STRUCT(readack_rx1,13);
 		/* the "corresponding" irq_mask */
@@ -609,17 +609,17 @@ static int mcp2515a_init_transfers(struct net_device* net)
 			callback_action[i],
 			mcp2515a_completed_transfers,net);
 		/* acknowledge the buffer overflows */
-		if (i & CALLBACK_CLEAR_INT_FLAGS) {
+		if (i & CALLBACK_CLEAR_INTF) {
 			TRANSFER_INIT_MODIFY(priv->transfers,
 						callback_action[i],
-						clear_irq,
+						clear_intf,
 						MCP2515_REG_CANINTF);
 		}
 		/* acknowledge the buffer overflows */
-		if (i & CALLBACK_CLEAR_ERR_FLAGS) {
+		if (i & CALLBACK_CLEAR_EFLG) {
 			TRANSFER_INIT_MODIFY(priv->transfers,
 					callback_action[i],
-					clear_err,
+					clear_eflg,
 					MCP2515_REG_EFLG);
 		}
 		/* read and acknowledge rx1 */
@@ -797,69 +797,6 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 	netif_rx_ni(skb);
 }
 
-static void mcp2515a_completed_read_status_error (struct net_device *net)
-{
-	struct mcp2515a_priv *priv = netdev_priv(net);
-	struct mcp2515a_transfers *trans = priv->transfers;
-	/* some status registers, we may need... */
-	/*
-	  u8 inte=trans->read_status.read_inte_intf_eflg.data[0];
-	  u8 intf=trans->read_status.read_inte_intf_eflg.data[1];
-	*/
-	u8 eflg = trans->read_status.read_inte_intf_eflg.data[2];
-	/* the error flags */
-	u32 err_id = 0;
-	u8 err_detail = 0;
-	/* overflow occurred */
-	if (eflg&(MCP2515_REG_EFLG_RX1OVR)) {
-		/* increment counters */
-		net->stats.rx_over_errors++;
-		net->stats.rx_errors++;
-		/* add bits */
-		err_id |= CAN_ERR_CRTL;
-		err_detail |= CAN_ERR_CRTL_RX_OVERFLOW;
-	}
-	/* the error handler for CAN BUS problems */
-	if ( eflg & (MCP2515_REG_EFLG_TXEP|MCP2515_REG_EFLG_RXEP) ) {
-		if (!priv->carrier_off) {
-			dev_err(&net->dev,
-				"CAN-Bus-error detected"
-				" - Error-flags: 0x%02x\n",
-				eflg);
-			priv->net->stats.tx_carrier_errors++;
-			netif_carrier_off(net);
-			priv->carrier_off = 1;
-			/* maybe reset here? */
-			/* maybe change "interrupt-mask" ? */
-		}
-	} else {
-		/* otherwise clear the message */
-		if (priv->carrier_off) {
-			dev_err(&net->dev,"CAN-Bus-error recovered\n");
-			netif_carrier_on(net);
-			priv->carrier_off = 0;
-		}
-	}
-	/* and deliver the error message if there is some data...*/
-	if (err_id) {
-		struct sk_buff *skb;
-		struct can_frame *frame;
-
-		/* allocate a frame to deliver */
-		skb = alloc_can_err_skb(priv->net, &frame);
-		if (!skb) {
-			netdev_err(priv->net,
-				"cannot allocate error message\n");
-			return;
-		}
-		/* assign data to it */
-		frame->can_id |= err_id;
-		frame->data[1] = err_detail;
-		/* and deliver it */
-		netif_rx_ni(skb);
-	}
-}
-
 static inline void mcp2515a_completed_transmit(
 	struct net_device *net, struct mcp2515a_priv *priv, u8 tx)
 {
@@ -907,48 +844,99 @@ static void mcp2515a_completed_read_status (void* context)
 	u8 eflg = trans->read_status.read_inte_intf_eflg.data[2];
 	/* structure to use*/
 	u8 structure = 0;
-	u8 clear_irq = 0;
-	u8 clear_err = 0;
+	u8 clear_intf = 0;
+	u8 clear_eflg = 0;
+	u32 err_id = 0;
+	u8 err_detail = 0;
 	int ret=0;
 	unsigned long flags;
+	struct sk_buff *skb;
+	struct can_frame *frame;
 
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
 
-	/* decide which structure we use */
-
-	/* handle overflow */
-	if (eflg & (MCP2515_REG_EFLG_RX1OVR|MCP2515_REG_EFLG_RX0OVR)) {
-		structure |= CALLBACK_CLEAR_ERR_FLAGS;
-		clear_err = MCP2515_REG_EFLG_RX1OVR
-			| MCP2515_REG_EFLG_RX0OVR;
+	/* handle errors */
+	if (eflg) {
+		structure |= CALLBACK_CLEAR_EFLG;
+		if (eflg & MCP2515_REG_EFLG_RX0OVR) {
+			clear_eflg = MCP2515_REG_EFLG_RX0OVR;
+			/* increment fifo counter */
+			net->stats.rx_fifo_errors++;
+		}
+		if (eflg & MCP2515_REG_EFLG_RX1OVR) {
+			clear_eflg = MCP2515_REG_EFLG_RX1OVR;
+			/* increment overflow from RX1 */
+			net->stats.rx_over_errors++;
+			net->stats.rx_errors++;
+			/* and schedule error message to send */
+			err_id     |= CAN_ERR_CRTL;
+			err_detail |= CAN_ERR_CRTL_RX_OVERFLOW;
+		}
+		/* handle Counter WARNING errors */
+		if (eflg & MCP2515_REG_EFLG_EWARN) {
+			clear_eflg = MCP2515_REG_EFLG_EWARN;
+			/* probably need to clean some more */
+			priv->can.can_stats.error_warning++;
+			/* and schedule error message to send */
+			err_id     |= CAN_ERR_CRTL;
+			err_detail |= CAN_ERR_CRTL_RX_WARNING
+				| CAN_ERR_CRTL_TX_WARNING;
+		}
+		/* handle passive */
+		if (eflg & MCP2515_REG_EFLG_TXEP) {
+			clear_eflg = MCP2515_REG_EFLG_TXEP;
+			/* need to do some more stuff - taking offline */
+			priv->can.can_stats.error_passive++;
+			err_id     |= CAN_ERR_CRTL ;
+			err_detail |= CAN_ERR_CRTL_TX_PASSIVE;
+		}
+		if (eflg & MCP2515_REG_EFLG_RXEP) {
+			clear_eflg = MCP2515_REG_EFLG_RXEP;
+			/* need to do some more stuff - taking offline */
+			priv->can.can_stats.error_passive++;
+			err_id     |= CAN_ERR_CRTL ;
+			err_detail |= CAN_ERR_CRTL_RX_PASSIVE;
+		}
+		/* handle Bus off */
+		if (eflg & MCP2515_REG_EFLG_TXBO) {
+			clear_eflg = MCP2515_REG_EFLG_TXBO;
+			/* need to do some more stuff - taking offline */
+			dev_err(&net->dev,
+				"CAN-Bus shut down because of"
+				" too many errors");
+			priv->net->stats.tx_carrier_errors++;
+			can_bus_off(net);
+			err_id|=CAN_ERR_BUSOFF ;
+		}
 	}
+
 	/* handle RX buffers */
 	if (status & MCP2515_CMD_STATUS_RX0IF ) {
-		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_RX0I;
+		structure |= CALLBACK_CLEAR_INTF;
+		clear_intf |= MCP2515_REG_CANINT_RX0I;
 	}
 	if (status & MCP2515_CMD_STATUS_RX1IF )
 		structure |= CALLBACK_READACK_RX1;
 
 	/* handle TX buffer interrupts */
 	if (status & MCP2515_CMD_STATUS_TX2IF) {
-		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_TX2I;
+		structure |= CALLBACK_CLEAR_INTF;
+		clear_intf |= MCP2515_REG_CANINT_TX2I;
 	}
 	if (status & MCP2515_CMD_STATUS_TX1IF) {
-		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_TX1I;
+		structure |= CALLBACK_CLEAR_INTF;
+		clear_intf |= MCP2515_REG_CANINT_TX1I;
 	}
 	if (status & MCP2515_CMD_STATUS_TX0IF) {
-		structure |= CALLBACK_CLEAR_INT_FLAGS;
-		clear_irq |= MCP2515_REG_CANINT_TX0I;
+		structure |= CALLBACK_CLEAR_INTF;
+		clear_intf |= MCP2515_REG_CANINT_TX0I;
 	}
 
-	/* now set the clear_irq bitmask */
-	trans->callback_action[structure].clear_irq.mask=clear_irq;
-	trans->callback_action[structure].clear_err.mask=clear_err;
+	/* now set the clear_intf bitmask */
+	trans->callback_action[structure].clear_intf.mask=clear_intf;
+	trans->callback_action[structure].clear_eflg.mask=clear_eflg;
 
 	/* and enable our own interrupts before actually scheduling the
 	 * transfer - this is happening here avoiding a race condition...
@@ -970,13 +958,10 @@ static void mcp2515a_completed_read_status (void* context)
 		/* and shut down transmit */
 	}
 
-	/* now handle the error situations - if such have occurred */
-	mcp2515a_completed_read_status_error(net);
-
 	/* and mark the tx-messages as released
 	 * ( in the correct priority order )
-	 * we handle this only here, as we want to dispatch the spi message
-	 * as soon as possible
+	 * we handle this only here, as we want to dispatch
+	 * the spi message as soon as possible
 	 */
 	if (status & MCP2515_CMD_STATUS_TX2IF) {
 		mcp2515a_completed_transmit(net,priv,2);
@@ -986,6 +971,21 @@ static void mcp2515a_completed_read_status (void* context)
 	}
 	if (status & MCP2515_CMD_STATUS_TX0IF) {
 		mcp2515a_completed_transmit(net,priv,0);
+	}
+
+	/* send can_error frame if needed */
+	if (err_id) {
+		skb = alloc_can_err_skb(priv->net, &frame);
+		if (!skb) {
+			netdev_err(priv->net,
+				"cannot allocate error message\n");
+		} else {
+			/* assign data to it */
+			frame->can_id |= err_id;
+			frame->data[1] = err_detail;
+			/* and deliver it */
+			netif_rx_ni(skb);
+		}
 	}
 }
 
