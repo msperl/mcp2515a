@@ -231,6 +231,12 @@ struct mcp2515a_priv {
 	/* flag to say we are shutting down */
 	u8 is_shutdown;
 
+	/* states */
+	u8 sysstate;
+#define SYSSTATE_WARN    (1<<0)
+#define SYSSTATE_PASSIVE (1<<1)
+#define SYSSTATE_BUSOFF  (1<<2)
+
 	/* lock used to
 	 * protect structure
 	 * avoid races scheduling multiple spi messages in one go
@@ -538,7 +544,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 				setconfig,
 				MCP2515_REG_CNF3);
 	data[0] = data[1] = data[2] = 0; /* CNF3,CNF2,CNF1 */
-	data[3] = 0x1f; /* INTE - enable all interupt sources */
+	data[3] = 0x3f; /* INTE - enable all interupt sources */
 	data[4] = 0x00; /* INTF - clear all interupt sources */
 
 	/* and change to the final mode we want to enter */
@@ -639,7 +645,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 					callback_action[i],
 					set_irq_mask,
 					MCP2515_REG_CANINTE);
-		data[0] = 0x1f; /* no MERRE, WAKIE */
+		data[0] = 0x3f; /* no MERRE, WAKIE */
 		/* and prepare the message */
 		SPI_MESSAGE_OPTIMIZE(spi,
 				&priv->transfers->callback_action[i].msg);
@@ -841,6 +847,8 @@ static void mcp2515a_completed_read_status (void* context)
 	struct mcp2515a_transfers *trans = priv->transfers;
 	/* get the status bits */
 	u8 status = trans->read_status.read_status.data[0];
+	u8 inte = trans->read_status.read_inte_intf_eflg.data[0];
+	u8 intf = trans->read_status.read_inte_intf_eflg.data[1];
 	u8 eflg = trans->read_status.read_inte_intf_eflg.data[2];
 	/* structure to use*/
 	u8 structure = 0;
@@ -848,6 +856,9 @@ static void mcp2515a_completed_read_status (void* context)
 	u8 clear_eflg = 0;
 	u32 err_id = 0;
 	u8 err_detail = 0;
+	u8 state = 0;
+	u8 last_state = priv->sysstate;
+
 	int ret=0;
 	unsigned long flags;
 	struct sk_buff *skb;
@@ -880,24 +891,33 @@ static void mcp2515a_completed_read_status (void* context)
 			/* probably need to clean some more */
 			priv->can.can_stats.error_warning++;
 			/* and schedule error message to send */
-			err_id     |= CAN_ERR_CRTL;
-			err_detail |= CAN_ERR_CRTL_RX_WARNING
-				| CAN_ERR_CRTL_TX_WARNING;
+			state |= SYSSTATE_WARN;
+			if (state>last_state) {
+				err_id     |= CAN_ERR_CRTL;
+				err_detail |= CAN_ERR_CRTL_RX_WARNING
+					| CAN_ERR_CRTL_TX_WARNING;
+			}
 		}
 		/* handle passive */
 		if (eflg & MCP2515_REG_EFLG_TXEP) {
 			clear_eflg = MCP2515_REG_EFLG_TXEP;
 			/* need to do some more stuff - taking offline */
 			priv->can.can_stats.error_passive++;
-			err_id     |= CAN_ERR_CRTL ;
-			err_detail |= CAN_ERR_CRTL_TX_PASSIVE;
+			state |= SYSSTATE_PASSIVE;
+			if (state>last_state) {
+				err_id     |= CAN_ERR_CRTL;
+				err_detail |= CAN_ERR_CRTL_TX_PASSIVE;
+			}
 		}
 		if (eflg & MCP2515_REG_EFLG_RXEP) {
 			clear_eflg = MCP2515_REG_EFLG_RXEP;
 			/* need to do some more stuff - taking offline */
 			priv->can.can_stats.error_passive++;
-			err_id     |= CAN_ERR_CRTL ;
-			err_detail |= CAN_ERR_CRTL_RX_PASSIVE;
+			state |= SYSSTATE_PASSIVE;
+			if (state>last_state) {
+				err_id     |= CAN_ERR_CRTL ;
+				err_detail |= CAN_ERR_CRTL_RX_PASSIVE;
+			}
 		}
 		/* handle Bus off */
 		if (eflg & MCP2515_REG_EFLG_TXBO) {
@@ -908,10 +928,16 @@ static void mcp2515a_completed_read_status (void* context)
 				" too many errors");
 			priv->net->stats.tx_carrier_errors++;
 			can_bus_off(net);
-			err_id|=CAN_ERR_BUSOFF ;
+			state |= SYSSTATE_BUSOFF;
+			if (state>last_state)
+				err_id|=CAN_ERR_BUSOFF ;
 		}
 	}
-
+	/* and check the intf flag for error - need to clean it */
+	if (intf & MCP2515_REG_CANINT_ERRI) {
+		structure |= CALLBACK_CLEAR_INTF;
+		clear_intf |= MCP2515_REG_CANINT_ERRI;
+	}
 	/* handle RX buffers */
 	if (status & MCP2515_CMD_STATUS_RX0IF ) {
 		structure |= CALLBACK_CLEAR_INTF;
@@ -937,6 +963,9 @@ static void mcp2515a_completed_read_status (void* context)
 	/* now set the clear_intf bitmask */
 	trans->callback_action[structure].clear_intf.mask=clear_intf;
 	trans->callback_action[structure].clear_eflg.mask=clear_eflg;
+
+	/* set systemstate to the current state */
+	priv->sysstate = state;
 
 	/* and enable our own interrupts before actually scheduling the
 	 * transfer - this is happening here avoiding a race condition...
