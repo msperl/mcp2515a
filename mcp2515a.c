@@ -1,5 +1,5 @@
 /*
- * Driver for Broadcom BCM2835 SPI Controllers
+ * Driver for MCP2515 CAN Controller
  *
  * Copyright (C) 2013 Martin Sperl
  *
@@ -54,6 +54,14 @@ MODULE_PARM_DESC(use_optimize,
 #else
 #define SPI_MESSAGE_OPTIMIZE(spi,message)
 #endif
+
+static bool use_dummy_complete = 1;
+module_param(use_dummy_complete,bool,0);
+MODULE_PARM_DESC(use_dummy_complete,
+		"run the spi_messages using dummy complete calls");
+static void mcp2515a_completed_dummy (void *data) { ; }
+#define USE_DUMMY_COMPLETE					\
+	(use_dummy_complete) ? mcp2515a_completed_dummy : NULL
 
 /* some functions to measure delays on a logic analyzer
  * note: needs to get run first from non-atomic context!!! */
@@ -448,7 +456,6 @@ struct mcp2515a_transfers {
 static irqreturn_t mcp2515a_interrupt_handler(int, void *);
 static void mcp2515a_completed_read_status (void *);
 static void mcp2515a_completed_transfers (void *);
-/*static void mcp2515a_completed_dummy (void *data) { ; }*/
 
 static void mcp2515a_free_transfers(struct net_device* net)
 {
@@ -502,7 +509,8 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* now let us fill in the data structures */
 
 	/* setting up receive policies for buffers */
-	TRANSFER_INIT(priv->transfers,config,NULL,NULL);
+	TRANSFER_INIT(priv->transfers,config,
+		USE_DUMMY_COMPLETE,NULL);
 	data = TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				setRXB0ctrl,
@@ -591,8 +599,9 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	 * the requirement for complete to be set - so some dummy code */
 	TRANSFER_INIT(priv->transfers,
 		read_status2,
-		NULL,
-		NULL);
+		USE_DUMMY_COMPLETE,
+		NULL
+		);
 	/* we read the error-count */
 	data = TRANSFER_INIT_READ(priv->transfers,
 				read_status2,
@@ -656,7 +665,7 @@ static int mcp2515a_init_transfers(struct net_device* net)
 
 		TRANSFER_INIT(priv->transfers,
 			transmit_tx[i],
-			NULL,
+			USE_DUMMY_COMPLETE,
 			NULL);
 		data = TRANSFER_INIT_WRITE(priv->transfers,
 				transmit_tx[i],
@@ -963,6 +972,7 @@ static void mcp2515a_completed_read_status (void* context)
 	/* now set the clear_intf bitmask */
 	trans->callback_action[structure].clear_intf.mask=clear_intf;
 	trans->callback_action[structure].clear_eflg.mask=clear_eflg;
+	trans->callback_action[structure].set_irq_mask.data[0]=inte;
 
 	/* set systemstate to the current state */
 	priv->sysstate = state;
