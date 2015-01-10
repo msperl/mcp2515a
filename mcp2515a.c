@@ -1236,7 +1236,7 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 		)
 #endif
 		priv->transfers->transmit_tx[tx].message.t_tx.len =
-			2 + 5 + frame->can_dlc;
+			2 + 6 + frame->can_dlc;
 
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
