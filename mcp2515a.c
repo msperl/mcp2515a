@@ -1,11 +1,7 @@
 /*
  * Driver for MCP2515 CAN Controller
  *
- * Copyright (C) 2013 Martin Sperl
- *
- * This driver is inspired by:
- * spi-ath79.c, Copyright (C) 2009-2011 Gabor Juhos <juhosg@openwrt.org>
- * spi-atmel.c, Copyright (C) 2006 Atmel Corporation
+ * Copyright (C) 2014 Martin Sperl
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -221,8 +217,6 @@ struct mcp2515a_priv {
 	dma_addr_t transfers_dma_addr;
 	/* the transfers */
 	struct mcp2515a_transfers *transfers;
-	/* the last transfer structure used */
-	u8 structure_used;
 
 	/* some counters for RX sent/received */
 	volatile u32 status_sent_count;
@@ -286,6 +280,7 @@ int mcp2515a_confirm_device(struct spi_device *spi)
 		return ret;
 	/* now wait for 10 ms - as per documentation */
 	mdelay(10);
+
 	/* and read the canstat and other values */
 	b[0] = MCP2515_CMD_READ;
 	b[1] = MCP2515_REG_CANSTAT;
@@ -304,6 +299,12 @@ int mcp2515a_confirm_device(struct spi_device *spi)
 	if (b[3] != 0x07)
 		goto mcp2515a_confirm_device_err;
 
+	/* log that we found the mcp2515 */
+	dev_info(&spi->dev,
+		"Found expected response from mcp2515 after reset:"
+		" CANSTAT 0x%02x CANCTRL 0x%02x\n",
+		b[2], b[3]);
+
 	/* ok, we have succeeded */
 	return 0;
 
@@ -315,82 +316,98 @@ mcp2515a_confirm_device_err:
 	return -ENODEV;
 }
 
-#define TRANSFER_INIT(base,message,callback,callbackdata)		\
+#define TRANSFER_INIT(base, message, callback, callbackdata)		\
 	spi_message_init(&base->message.msg);				\
 	base->message.msg.is_dma_mapped = 1;				\
 	base->message.msg.complete = callback;				\
 	base->message.msg.context = callbackdata;
 
-#define TRANSFER_WRITE_STRUCT(name,datalen) \
-	struct { \
-		u8 cmd; \
-		u8 reg; \
-		u8 data[datalen]; \
-		struct spi_transfer t_tx;\
+#define TRANSFER_CMD_STRUCT(name, fields)	   \
+	struct {				   \
+		u8 cmd;				   \
+		fields;				   \
+		struct spi_transfer trans;	   \
 	} name;
-#define TRANSFER_INIT_WRITE(base,message,xfer,regist)			\
-	base->message.xfer.data;					\
-	base->message.xfer.cmd = MCP2515_CMD_WRITE;			\
-	base->message.xfer.reg = regist;				\
-	base->message.xfer.t_tx.len = 2					\
-		+ sizeof(base->message.xfer.data);			\
-	base->message.xfer.t_tx.tx_buf = &base->message.xfer.cmd;	\
-	base->message.xfer.t_tx.rx_buf = NULL;				\
-	base->message.xfer.t_tx.tx_dma = base##_dma_addr		\
-		+ offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
-	base->message.xfer.t_tx.rx_dma = 0;				\
-	base->message.xfer.t_tx.cs_change = 1;				\
-	spi_message_add_tail(&base->message.xfer.t_tx,&base->message.msg);
 
-#define TRANSFER_MODIFY_STRUCT(name) \
-	struct { \
-		u8 cmd; \
-		u8 reg; \
-		u8 mask; \
-		u8 value; \
-		struct spi_transfer t_modify;\
-	} name;
+#define TRANSFER_INIT_SET_ADDR(base, message, xfer, field, ptr)	\
+	if (ptr) {							\
+		base->message.xfer.trans.field##_buf = ptr;		\
+		base->message.xfer.trans.field##_dma = base##_dma_addr	\
+			+ ((void *)ptr - (void *)base);			\
+	} else {							\
+		base->message.xfer.trans.field##_buf = NULL;		\
+		base->message.xfer.trans.field##_dma = 0;		\
+	}
+
+#define TRANSFER_INIT_CMD(base,message,xfer,command)			\
+	base->message.xfer.cmd = command;				\
+	TRANSFER_INIT_SET_ADDR(base, message, xfer,			\
+			tx, &base->message.xfer.cmd);			\
+	base->message.xfer.trans.cs_change = 1;				\
+	spi_message_add_tail(&base->message.xfer.trans,			\
+			&base->message.msg);				\
+	TRANSFER_INIT_SET_ADDR(base, message, xfer,			\
+			rx, NULL);					\
+
+
+#define TRANSFER_WRITE_STRUCT(name, datalen)	\
+	TRANSFER_CMD_STRUCT(name,		\
+			u8 reg;			\
+			u8 data[datalen];	\
+		)
+
+#define TRANSFER_INIT_WRITE(base,message,xfer,regist)			\
+	TRANSFER_INIT_CMD(base,message,xfer,MCP2515_CMD_WRITE);		\
+	base->message.xfer.trans.len = 2 /* CMD write + address */	\
+		+ sizeof(base->message.xfer.data) /* payload size itself */; \
+	base->message.xfer.reg = regist;				\
+
+#define TRANSFER_MODIFY_STRUCT(name)		\
+	TRANSFER_CMD_STRUCT(name,		\
+			u8 reg;			\
+			u8 mask;		\
+			u8 value;		\
+		)
+
 #define TRANSFER_INIT_MODIFY(base,message,xfer,regist)			\
-	base->message.xfer.cmd = MCP2515_CMD_MODIFY;			\
+	TRANSFER_INIT_CMD(base,message,xfer,MCP2515_CMD_MODIFY);	\
+	base->message.xfer.trans.len = 4;				\
 	base->message.xfer.reg = regist;				\
 	base->message.xfer.mask = 0;					\
-	base->message.xfer.value = 0;					\
-	base->message.xfer.t_modify.len = 4;				\
-	base->message.xfer.t_modify.tx_buf = &base->message.xfer.cmd;	\
-	base->message.xfer.t_modify.rx_buf = NULL;			\
-	base->message.xfer.t_modify.tx_dma = base##_dma_addr		\
-		+ offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
-	base->message.xfer.t_modify.rx_dma = 0;				\
-	base->message.xfer.t_modify.cs_change = 1;			\
-	spi_message_add_tail(&base->message.xfer.t_modify,&base->message.msg);
+	base->message.xfer.value = 0;
 
-#define TRANSFER_READ_STRUCT(name,datalen) \
-	struct { \
-		u8 cmd; \
-		u8 reg; \
-		u8 data[datalen]; \
-		struct spi_transfer t_tx;\
-		struct spi_transfer t_rx;\
-	} name;
+#define TRANSFER_READ_STRUCT(name,datalen)		\
+	TRANSFER_CMD_STRUCT(name,			\
+			u8 reg;				\
+			u8 dummydata[datalen];		\
+			u8 cmd_rx;			\
+			u8 reg_rx;			\
+			u8 data[datalen];		\
+		)
+
 #define TRANSFER_INIT_READ(base,message,xfer,regist)			\
-	base->message.xfer.data;					\
-	base->message.xfer.cmd = MCP2515_CMD_READ;			\
+	TRANSFER_INIT_CMD(base,message,xfer,MCP2515_CMD_READ);		\
 	base->message.xfer.reg = regist;				\
-	base->message.xfer.t_tx.len = 2;				\
-	base->message.xfer.t_tx.tx_buf = &base->message.xfer.cmd;	\
-	base->message.xfer.t_tx.rx_buf = NULL;				\
-	base->message.xfer.t_tx.tx_dma = base##_dma_addr		\
-		+ offsetof(struct mcp2515a_transfers,message.xfer.cmd);	\
-	base->message.xfer.t_rx.rx_dma = 0;				\
-	spi_message_add_tail(&base->message.xfer.t_tx,&base->message.msg); \
-	base->message.xfer.t_rx.len = sizeof(base->message.xfer.data);	\
-	base->message.xfer.t_rx.rx_buf = &base->message.xfer.data;	\
-	base->message.xfer.t_rx.tx_buf = NULL;				\
-	base->message.xfer.t_rx.rx_dma = base##_dma_addr		\
-		+ offsetof(struct mcp2515a_transfers,message.xfer.data); \
-	base->message.xfer.t_rx.tx_dma = 0;				\
-	base->message.xfer.t_rx.cs_change = 1;				\
-	spi_message_add_tail(&base->message.xfer.t_rx,&base->message.msg);
+	base->message.xfer.trans.len = 2 /* CMD write + address */	\
+		+ sizeof(base->message.xfer.data)			\
+		/* payload size itself */;				\
+	TRANSFER_INIT_SET_ADDR(base, message, xfer,			\
+			rx, &base->message.xfer.cmd_rx);
+
+#define TRANSFER_QREAD_STRUCT(name,datalen)		\
+	TRANSFER_CMD_STRUCT(name,			\
+			u8 dummydata[datalen];		\
+			u8 cmd_rx;			\
+			u8 data[datalen];		\
+		)
+
+#define TRANSFER_INIT_QREAD(base,message,xfer,command)			\
+	TRANSFER_INIT_CMD(base,message,xfer,command);			\
+	base->message.xfer.trans.len = 1 /* CMD READ_RX_BUFFER */	\
+		+ sizeof(base->message.xfer.data)			\
+		/* max payload size itself */;				\
+	TRANSFER_INIT_SET_ADDR(base, message, xfer,			\
+			rx, &base->message.xfer.cmd_rx);
 
 struct mcp2515a_transfers {
 	/* the messages */
@@ -405,11 +422,11 @@ struct mcp2515a_transfers {
 		TRANSFER_WRITE_STRUCT(changetomode,1);
 		TRANSFER_READ_STRUCT(readconfig,8);
 	} config;
-	/* the messages we schedule in response to the irq pin going down */
+	/* the messages we schedule in response to the irq going down */
 	struct {
 		struct spi_message msg;
 		/* read the status flags quickly */
-		TRANSFER_READ_STRUCT(read_status,1);
+		TRANSFER_QREAD_STRUCT(read_status, 1);
 		/* read the interrupt mask, sources and the error flags */
 		TRANSFER_READ_STRUCT(read_inte_intf_eflg,3);
 		/* clear the interrupts */
@@ -433,14 +450,16 @@ struct mcp2515a_transfers {
 #define CALLBACK_CLEAR_INTF  (1<<1)
 #define CALLBACK_READACK_RX1 (1<<2)
 #define CALLBACK_SIZE        8
-	struct {
+	struct callback_actions {
 		struct spi_message msg;
-		/* clear error flags - if needed - CALLBACK_CLEAR_ERR_FLAGS */
+		struct net_device *net;
+		int status;
+		/* clear error flags - CALLBACK_CLEAR_ERR_FLAGS */
 		TRANSFER_MODIFY_STRUCT(clear_eflg);
-		/* clear irq flags - if needed - CALLBACK_CLEAR_IRQ_FLAGS */
+		/* clear irq flags - CALLBACK_CLEAR_IRQ_FLAGS */
 		TRANSFER_MODIFY_STRUCT(clear_intf);
-		/* read+ack RX1 - if needed - CALLBACK_READACK_RX1 */
-		TRANSFER_READ_STRUCT(readack_rx1,13);
+		/* read+ack RX1 - CALLBACK_READACK_RX1 */
+		TRANSFER_QREAD_STRUCT(readack_rx1,13);
 		/* the "corresponding" irq_mask */
 		TRANSFER_WRITE_STRUCT(set_irq_mask,1);
 	} callback_action[CALLBACK_SIZE];
@@ -493,7 +512,6 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
         struct device *dev = &spi->dev;
-	u8* data;
 	int i;
 	/* first forece the coherent mask
 	   - a bit of a hack, but at least it works... */
@@ -511,62 +529,73 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	/* setting up receive policies for buffers */
 	TRANSFER_INIT(priv->transfers,config,
 		USE_DUMMY_COMPLETE,NULL);
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				setRXB0ctrl,
 				MCP2515_REG_RXB0CTRL);
-	data[0] = MCP2515_REG_RXB_RXM_ANY /* receive any message */
+	priv->transfers->config.setRXB0ctrl.data[0] =
+		MCP2515_REG_RXB_RXM_ANY /* receive any message */
                 | MCP2515_REG_RXB_BUKT; /* rollover to RXB1*/
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				setRXB1ctrl,
 				MCP2515_REG_RXB1CTRL);
-	data[0] = MCP2515_REG_RXB_RXM_ANY; /* receive any message */
+	priv->transfers->config.setRXB1ctrl.data[0] =
+		MCP2515_REG_RXB_RXM_ANY; /* receive any message */
 
 	/* clear TEC/REC */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				seterrorcounter,
 				MCP2515_REG_TEC);
-	data[0] = 0; /* tec */
-	data[1] = 0; /* rec */
+	priv->transfers->config.seterrorcounter.data[0] = 0; /* tec */
+	priv->transfers->config.seterrorcounter.data[1] = 0; /* rec */
 
 	/* move to config mode */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				changetoconfigmode,
 				MCP2515_REG_CANCTRL);
-	data[0] = MCP2515_REG_CANCTRL_REQOP_CONFIG;
+	priv->transfers->config.changetoconfigmode.data[0] =
+		MCP2515_REG_CANCTRL_REQOP_CONFIG;
 
 	/* clear bit ctrl */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				setpinctrl,
 				MCP2515_REG_BFPCTRL);
-	data[0] = 0; /* BFPCTRL - high impedance */
-	data[1] = 0; /* TXRTSCTRL - no functionality*/
+	priv->transfers->config.setpinctrl.data[0] =
+		0; /* BFPCTRL - high impedance */
+	priv->transfers->config.setpinctrl.data[1] =
+		0; /* TXRTSCTRL - no functionality*/
 
 	/* configure CNF and interrupt-registers */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				config,
 				setconfig,
 				MCP2515_REG_CNF3);
-	data[0] = data[1] = data[2] = 0; /* CNF3,CNF2,CNF1 */
-	data[3] = 0x3f; /* INTE - enable all interupt sources */
-	data[4] = 0x00; /* INTF - clear all interupt sources */
+	priv->transfers->config.setconfig.data[0] = 0; /* CNF3 */
+	priv->transfers->config.setconfig.data[1] = 0; /* CNF2 */
+	priv->transfers->config.setconfig.data[2] = 0; /* CNF1 */
+	priv->transfers->config.setconfig.data[3] =
+		0x3f; /* INTE - enable all interupt sources */
+	priv->transfers->config.setconfig.data[4] =
+		0x00; /* INTF - clear all interupt sources */
 
 	/* and change to the final mode we want to enter */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
-				config,
-				changetomode,
-				MCP2515_REG_CANCTRL);
-	data[0] = MCP2515_REG_CANCTRL_REQOP_NORMAL;
+	TRANSFER_INIT_WRITE(priv->transfers,
+			config,
+			changetomode,
+			MCP2515_REG_CANCTRL);
+	priv->transfers->config.changetomode.data[0] =
+		MCP2515_REG_CANCTRL_REQOP_NORMAL;
 
 	/* initiate read of basic configs */
-	data = TRANSFER_INIT_READ(priv->transfers,
-				config,
-				readconfig,
-				MCP2515_REG_CNF3);
+	TRANSFER_INIT_READ(priv->transfers,
+			config,
+			readconfig,
+			MCP2515_REG_CNF3);
 
 	/* The read status transfer with the callback */
 	TRANSFER_INIT(priv->transfers,
@@ -575,43 +604,41 @@ static int mcp2515a_init_transfers(struct net_device* net)
 		net);
 	/* add the STATUS read transfer
 	   - we modify the length and command */
-	data = TRANSFER_INIT_READ(priv->transfers,
-				read_status,
-				read_status,
-				0);
+	TRANSFER_INIT_QREAD(priv->transfers,
+			read_status,
+			read_status,
+			MCP2515_CMD_STATUS);
 	priv->transfers->read_status.read_status.cmd = MCP2515_CMD_STATUS;
-	priv->transfers->read_status.read_status.t_tx.len = 1;
+	priv->transfers->read_status.read_status.trans.len = 2;
 	/* add the read interrupts and error registers */
-	data = TRANSFER_INIT_READ(priv->transfers,
-				read_status,
-				read_inte_intf_eflg,
-				MCP2515_REG_CANINTE);
+	TRANSFER_INIT_READ(priv->transfers,
+			read_status,
+			read_inte_intf_eflg,
+			MCP2515_REG_CANINTE);
 	/* and clear the interrupt mask, so no more IRQ occurs */
-	data = TRANSFER_INIT_WRITE(priv->transfers,
+	TRANSFER_INIT_WRITE(priv->transfers,
 				read_status,
 				clear_inte,
 				MCP2515_REG_CANINTE);
-	data[0] = 0;
+	priv->transfers->read_status.clear_inte.data[0] = 0;
 	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->read_status.msg);
 
-	/* the second status message that gets scheduled
-	 * - this time without callbacks for some reason 3.13 interuduced
-	 * the requirement for complete to be set - so some dummy code */
+	/* the second status message that gets scheduled */
 	TRANSFER_INIT(priv->transfers,
 		read_status2,
 		USE_DUMMY_COMPLETE,
 		NULL
 		);
 	/* we read the error-count */
-	data = TRANSFER_INIT_READ(priv->transfers,
-				read_status2,
-				read_tec_rec,
-				MCP2515_REG_TEC);
+	TRANSFER_INIT_READ(priv->transfers,
+			read_status2,
+			read_tec_rec,
+			MCP2515_REG_TEC);
 	/* and we read the RX0 buffer... */
-	data = TRANSFER_INIT_READ(priv->transfers,
-				read_status2,
-				read_rx0,
-				MCP2515_REG_RXB0CTRL+1);
+	TRANSFER_INIT_READ(priv->transfers,
+			read_status2,
+			read_rx0,
+			MCP2515_REG_RXB0CTRL+1);
 	SPI_MESSAGE_OPTIMIZE(spi,&priv->transfers->read_status2.msg);
 
 	/* and the callback action transfer in all variants - we want to
@@ -622,7 +649,9 @@ static int mcp2515a_init_transfers(struct net_device* net)
 	for ( i=0 ; i<CALLBACK_SIZE; i++) {
 		TRANSFER_INIT(priv->transfers,
 			callback_action[i],
-			mcp2515a_completed_transfers,net);
+			mcp2515a_completed_transfers,
+			&priv->transfers->callback_action[i]);
+		priv->transfers->callback_action[i].net = net;
 		/* acknowledge the buffer overflows */
 		if (i & CALLBACK_CLEAR_INTF) {
 			TRANSFER_INIT_MODIFY(priv->transfers,
@@ -639,22 +668,19 @@ static int mcp2515a_init_transfers(struct net_device* net)
 		}
 		/* read and acknowledge rx1 */
 		if (i & CALLBACK_READACK_RX1) {
-			data=TRANSFER_INIT_READ(priv->transfers,
-						callback_action[i],
-						readack_rx1,
-						0);
-			priv->transfers->
-				callback_action[i].readack_rx1.cmd =
-				MCP2515_CMD_READ_RX(1);
-			priv->transfers->
-				callback_action[i].readack_rx1.t_tx.len = 1;
+			TRANSFER_INIT_QREAD(priv->transfers,
+					callback_action[i],
+					readack_rx1,
+					MCP2515_CMD_READ_RX(1)
+				);
 		}
 		/* and set the IRQ mask back again */
-		data = TRANSFER_INIT_WRITE(priv->transfers,
-					callback_action[i],
-					set_irq_mask,
-					MCP2515_REG_CANINTE);
-		data[0] = 0x3f; /* no MERRE, WAKIE */
+		TRANSFER_INIT_WRITE(priv->transfers,
+				callback_action[i],
+				set_irq_mask,
+				MCP2515_REG_CANINTE);
+		priv->transfers->callback_action[i].set_irq_mask.data[0] =
+			0x3f; /* no MERRE, WAKIE */
 		/* and prepare the message */
 		SPI_MESSAGE_OPTIMIZE(spi,
 				&priv->transfers->callback_action[i].msg);
@@ -667,17 +693,17 @@ static int mcp2515a_init_transfers(struct net_device* net)
 			transmit_tx[i],
 			USE_DUMMY_COMPLETE,
 			NULL);
-		data = TRANSFER_INIT_WRITE(priv->transfers,
+		TRANSFER_INIT_WRITE(priv->transfers,
 				transmit_tx[i],
-					message,
-					MCP2515_REG_TXBCTRL(i));
-		data = TRANSFER_INIT_WRITE(priv->transfers,
-					transmit_tx[i],
-					transmit,
-					0 /* not needed */);
+				message,
+				MCP2515_REG_TXBCTRL(i));
+		TRANSFER_INIT_WRITE(priv->transfers,
+				transmit_tx[i],
+				transmit,
+				0 /* not needed */);
 		priv->transfers->transmit_tx[i].transmit.cmd =
 			MCP2515_CMD_REQ2SEND((1<<i));
-		priv->transfers->transmit_tx[i].transmit.t_tx.len = 1;
+		priv->transfers->transmit_tx[i].transmit.trans.len = 1;
 		SPI_MESSAGE_OPTIMIZE(
 			spi,&priv->transfers->transmit_tx[i].msg);
 	}
@@ -970,9 +996,12 @@ static void mcp2515a_completed_read_status (void* context)
 	}
 
 	/* now set the clear_intf bitmask */
-	trans->callback_action[structure].clear_intf.mask=clear_intf;
-	trans->callback_action[structure].clear_eflg.mask=clear_eflg;
-	trans->callback_action[structure].set_irq_mask.data[0]=inte;
+	trans->callback_action[structure].clear_intf.mask = clear_intf;
+	trans->callback_action[structure].clear_eflg.mask = clear_eflg;
+	trans->callback_action[structure].set_irq_mask.data[0] = inte;
+
+	/* and keep the status for postprocessing */
+	trans->callback_action[structure].status = status;
 
 	/* set systemstate to the current state */
 	priv->sysstate = state;
@@ -983,10 +1012,13 @@ static void mcp2515a_completed_read_status (void* context)
 	enable_irq(priv->spi->irq);
 
 	/* schedule the transfer */
+	set_high();
 	spin_lock_irqsave(&priv->lock,flags);
-	priv->structure_used = structure;
+	set_low();
 	ret = spi_async(priv->spi,&trans->callback_action[structure].msg);
+	set_high();
 	spin_unlock_irqrestore(&priv->lock,flags);
+	set_low();
 	if (ret) {
 		/* disable interrupts again
 		 * to avoid that the system falls over
@@ -1030,22 +1062,13 @@ static void mcp2515a_completed_read_status (void* context)
 
 void mcp2515a_completed_transfers (void *context)
 {
-	struct net_device *net = context;
+	struct callback_actions *ca = context;
+	struct net_device *net = ca->net;
 	struct mcp2515a_priv *priv = netdev_priv(net);
 	struct mcp2515a_transfers *trans = priv->transfers;
-	u8 structure;
 	/* get the status bits */
-	u8 status = trans->read_status.read_status.data[0];
+	u8 status = ca->status;
 
-	/* reset structure andexit if empty */
-	structure = priv->structure_used;
-	priv->structure_used = 0xff;
-	if (structure==0xff) {
-		dev_printk(KERN_ERR,&net->dev,
-			"mcp2515a_completed_transfer: "
-			"unexpected callback\n");
-		return;
-	}
 	/* return early if we are shutdown */
 	if (priv->is_shutdown)
 		return;
@@ -1059,7 +1082,7 @@ void mcp2515a_completed_transfers (void *context)
 		priv->net->stats.rx_fifo_errors++;
 		mcp2515a_queue_rx_message(
 			priv,
-			trans->callback_action[structure].readack_rx1.data);
+			ca->readack_rx1.data);
 	}
 }
 
@@ -1231,12 +1254,15 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 	if (
 		(priv->transfers->transmit_tx[tx].msg.is_optimized)
 		&&
-		(priv->transfers->transmit_tx[tx].message.t_tx.vary
+		(priv->transfers->transmit_tx[tx].message.trans.vary
 			& SPI_OPTIMIZE_VARY_LENGTH)
 		)
 #endif
-		priv->transfers->transmit_tx[tx].message.t_tx.len =
-			2 + 6 + frame->can_dlc;
+		priv->transfers->transmit_tx[tx].message.trans.len =
+		  2 /* 2 bytes: write cmd + address TXBXCTRL */
+		  + 6 /* 6 bytes: TXBXCTRL, TXBXSIDH, TXBXSIDL, TXBXESID8,
+			 TXBXESID0 and TXBXDLC */
+		  + frame->can_dlc /* real payload length */;
 
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
@@ -1258,12 +1284,28 @@ return_busy:
 	return NETDEV_TX_BUSY;
 }
 
+static int mcp2515a_get_berr_counter(const struct net_device *net,
+				struct can_berr_counter *bec)
+{
+        struct mcp2515a_priv *priv = netdev_priv(net);
+
+	bec->txerr = priv->transfers->read_status2.read_tec_rec.data[0];
+	bec->rxerr = priv->transfers->read_status2.read_tec_rec.data[1];
+
+	return 0;
+}
+
 static int mcp2515a_open(struct net_device *net)
 {
         struct mcp2515a_priv *priv = netdev_priv(net);
         struct spi_device *spi = priv->spi;
         int ret;
-	int flags=0;
+
+	/* only open when the bitrate is defined
+	 * - avoids unneccessary messages
+	 */
+	if (!priv->can.bittiming.tq && !priv->can.bittiming.bitrate)
+		return -EINVAL;
 
 	/* try to open the can device */
         ret = open_candev(net);
@@ -1288,8 +1330,8 @@ static int mcp2515a_open(struct net_device *net)
 
 	/* and log a message */
 	dev_info(&net->dev,
-		"Started device with irq %i and irq flags=0x%x\n",
-		spi->irq,flags);
+		"Started mcp2515 device with irq %i\n",
+		spi->irq);
 
 	/* and return */
         return 0;
@@ -1343,6 +1385,7 @@ static int mcp2515a_probe(struct spi_device *spi)
 	struct mcp2515a_priv *priv;
         int ret;
 
+	set_high();
 	/* Platform data is required for osc freq */
 	if (!pdata)
 		return -ENODEV;
@@ -1364,7 +1407,6 @@ static int mcp2515a_probe(struct spi_device *spi)
 	SET_NETDEV_DEV(net, &spi->dev);
 	/*  link in the device ops */
 	net->netdev_ops = &mcp2515a_netdev_ops;
-	net->flags |= IFF_ECHO;
 
 	/* get the private data and fill in details */
 	priv = netdev_priv(net);
@@ -1379,9 +1421,11 @@ static int mcp2515a_probe(struct spi_device *spi)
         priv->can.ctrlmode_supported =
 		CAN_CTRLMODE_3_SAMPLES
                 | CAN_CTRLMODE_LOOPBACK
+		| CAN_CTRLMODE_BERR_REPORTING
 		| CAN_CTRLMODE_LISTENONLY
 		| CAN_CTRLMODE_ONE_SHOT ;
         priv->can.do_set_mode = mcp2515a_do_set_mode;
+	priv->can.do_get_berr_counter = mcp2515a_get_berr_counter;
 
 	/* default TX-Priority */
 	priv->tx_next_priority = TX_PRIORITY_MAX;
@@ -1445,7 +1489,6 @@ static int mcp2515a_can_resume(struct device *dev)
 {
 	return 0;
 }
-
 
 static SIMPLE_DEV_PM_OPS(mcp2515a_powermanagement_ops,
 			mcp2515a_can_suspend,
