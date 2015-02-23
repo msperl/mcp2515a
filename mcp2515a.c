@@ -204,9 +204,9 @@ static void set_high(void) {
 #define MCP2515_MSG_SIDL_IDE       (1<<3)
 #define MCP2515_MSG_EIDH           2
 #define MCP2515_MSG_EIDL           3
-#define MCP2515_MSG_DCL            4
-#define MCP2515_MSG_DCL_RTR        (1<<6)
-#define MCP2515_MSG_DCL_MASK        0x0f
+#define MCP2515_MSG_DLC            4
+#define MCP2515_MSG_DLC_RTR        (1<<6)
+#define MCP2515_MSG_DLC_MASK       0x0f
 #define MCP2515_MSG_DATA           5
 
 struct mcp2515a_transfers;
@@ -766,12 +766,12 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 
 	/* parse the can_id */
 	/* and handle extended - if needed */
-	if (data[MCP2515_MSG_SIDL]|MCP2515_MSG_SIDL_IDE) {
+	if (data[MCP2515_MSG_SIDL] & MCP2515_MSG_SIDL_IDE) {
 		frame->can_id |=
 			/* the extended flag */
 			CAN_EFF_FLAG
 			/* RTR */
-			| ((data[MCP2515_MSG_DCL] & MCP2515_MSG_DCL_RTR) ?
+			| ((data[MCP2515_MSG_DLC] & MCP2515_MSG_DLC_RTR) ?
 				CAN_RTR_FLAG : 0)
 			/* the extended Address - top 2 bits */
 			| ((data[MCP2515_MSG_SIDL]&MCP2515_MSG_SIDL_EMASK)
@@ -795,7 +795,7 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
 		;
 	/* get data length */
 	frame->can_dlc = get_can_dlc(
-		data[MCP2515_MSG_DCL] & MCP2515_MSG_DCL_MASK);
+		data[MCP2515_MSG_DLC] & MCP2515_MSG_DLC_MASK);
 
 	/* copy data */
 	memcpy(frame->data,
@@ -1236,7 +1236,7 @@ static netdev_tx_t mcp2515a_start_xmit(struct sk_buff *skb,
 		)
 #endif
 		priv->transfers->transmit_tx[tx].message.t_tx.len =
-			2 + 5 + frame->can_dlc;
+			2 + 6 + frame->can_dlc;
 
 	/* transfer and forget */
 	spi_async(priv->spi, &priv->transfers->transmit_tx[tx].msg);
