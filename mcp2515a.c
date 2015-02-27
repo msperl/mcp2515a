@@ -205,6 +205,9 @@ static void set_high(void) {
 #define MCP2515_MSG_DLC_MASK       0x0f
 #define MCP2515_MSG_DATA           5
 
+#define SET_BYTE(val, byte)                     \
+        (((val) & 0xff) << ((byte) * 8))
+
 struct mcp2515a_transfers;
 
 /* the driver structure */
@@ -791,34 +794,30 @@ static void mcp2515a_queue_rx_message(struct mcp2515a_priv *priv, char* data)
         }
 
 	/* parse the can_id */
-	/* and handle extended - if needed */
 	if (data[MCP2515_MSG_SIDL] & MCP2515_MSG_SIDL_IDE) {
+		/* Extended ID format */
+		frame->can_id = CAN_EFF_FLAG;
 		frame->can_id |=
-			/* the extended flag */
-			CAN_EFF_FLAG
-			/* RTR */
-			| ((data[MCP2515_MSG_DLC] & MCP2515_MSG_DLC_RTR) ?
-				CAN_RTR_FLAG : 0)
-			/* the extended Address - top 2 bits */
-			| ((data[MCP2515_MSG_SIDL]&MCP2515_MSG_SIDL_EMASK)
-				<< (2*8+11))
-			/* the extended Address EXTH */
-			| (data[MCP2515_MSG_EIDH] << (1*8+11))
-			/* the extended Address EXTL */
-			| (data[MCP2515_MSG_EIDL] << (0*8+11))
-			;
+			/* Extended ID part */
+			SET_BYTE(data[MCP2515_MSG_SIDL] & MCP2515_MSG_SIDL_EMASK, 2) |
+			SET_BYTE(data[MCP2515_MSG_EIDH], 1) |
+			SET_BYTE(data[MCP2515_MSG_EIDL], 0) |
+			/* Standard ID part */
+			(((data[MCP2515_MSG_SIDH] << MCP2515_MSG_SIDH_SHIFT)
+				|(data[MCP2515_MSG_SIDL] >> MCP2515_MSG_SIDL_SHIFT)
+				) << 18);
+		/* Remote transmission request */
+		if (data[MCP2515_MSG_DLC] & MCP2515_MSG_DLC_RTR)
+			frame->can_id |= CAN_RTR_FLAG;
 	} else {
+		/* Standard ID format */
 		frame->can_id =
-			/* handle RTR */
-			( (data[MCP2515_MSG_SIDL] & MCP2515_MSG_SIDL_SRR) ?
-				CAN_RTR_FLAG : 0)
-			;
+			(data[MCP2515_MSG_SIDH] << MCP2515_MSG_SIDH_SHIFT) |
+			(data[MCP2515_MSG_SIDL] >> MCP2515_MSG_SIDL_SHIFT);
+		if (data[MCP2515_MSG_SIDL] & MCP2515_MSG_SIDL_SRR)
+			frame->can_id |= CAN_RTR_FLAG;
 	}
-	/* and add the standard header */
-	frame->can_id |=
-		(data[MCP2515_MSG_SIDH] << 3)
-		| (data[MCP2515_MSG_SIDL] >> 5)
-		;
+
 	/* get data length */
 	frame->can_dlc = get_can_dlc(
 		data[MCP2515_MSG_DLC] & MCP2515_MSG_DLC_MASK);

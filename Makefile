@@ -1,4 +1,4 @@
-obj-m := mcp2515a.o enc28j60.o
+obj-m := mcp2515a.o #enc28j60.o
 KDIR := /lib/modules/$(shell uname -r)/build
 PWD := $(shell pwd)
 
